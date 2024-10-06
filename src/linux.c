@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,13 +15,15 @@
  */
 
 #include <sys/param.h>
+#include <sys/random.h>
 #include <sys/epoll.h>
-#include <sys/prctl.h>
 #include <sys/sendfile.h>
+#include <sys/syscall.h>
 
 #include <sched.h>
 
 #include "kore.h"
+#include "seccomp.h"
 
 #if defined(KORE_USE_PGSQL)
 #include "pgsql.h"
@@ -40,8 +42,9 @@ kore_platform_init(void)
 {
 	long		n;
 
+	kore_seccomp_init();
+
 	if ((n = sysconf(_SC_NPROCESSORS_ONLN)) == -1) {
-		kore_debug("could not get number of cpu's falling back to 1");
 		cpu_count = 1;
 	} else {
 		cpu_count = (u_int16_t)n;
@@ -55,12 +58,9 @@ kore_platform_worker_setcpu(struct kore_worker *kw)
 
 	CPU_ZERO(&cpuset);
 	CPU_SET(kw->cpu, &cpuset);
-	if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == -1) {
-		kore_debug("kore_worker_setcpu(): %s", errno_s);
-	} else {
-		kore_debug("kore_worker_setcpu(): worker %d on cpu %d",
-		    kw->id, kw->cpu);
-	}
+
+	if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == -1)
+		kore_log(LOG_NOTICE, "kore_worker_setcpu(): %s", errno_s);
 }
 
 void
@@ -111,10 +111,6 @@ kore_platform_event_wait(u_int64_t timer)
 		fatal("epoll_wait(): %s", errno_s);
 	}
 
-	if (n > 0) {
-		kore_debug("main(): %d sockets available", n);
-	}
-
 	r = 0;
 	for (i = 0; i < n; i++) {
 		if (events[i].data.ptr == NULL)
@@ -139,6 +135,18 @@ kore_platform_event_wait(u_int64_t timer)
 }
 
 void
+kore_platform_event_level_all(int fd, void *c)
+{
+	kore_platform_event_schedule(fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP, 0, c);
+}
+
+void
+kore_platform_event_level_read(int fd, void *c)
+{
+	kore_platform_event_schedule(fd, EPOLLIN | EPOLLRDHUP, 0, c);
+}
+
+void
 kore_platform_event_all(int fd, void *c)
 {
 	kore_platform_event_schedule(fd,
@@ -149,9 +157,6 @@ void
 kore_platform_event_schedule(int fd, int type, int flags, void *udata)
 {
 	struct epoll_event	evt;
-
-	kore_debug("kore_platform_event_schedule(%d, %d, %d, %p)",
-	    fd, type, flags, udata);
 
 	evt.events = type;
 	evt.data.ptr = udata;
@@ -188,28 +193,32 @@ void
 kore_platform_enable_accept(void)
 {
 	struct listener		*l;
+	struct kore_server	*srv;
 
-	kore_debug("kore_platform_enable_accept()");
-
-	LIST_FOREACH(l, &listeners, list)
-		kore_platform_event_schedule(l->fd, EPOLLIN, 0, l);
+	LIST_FOREACH(srv, &kore_servers, list) {
+		LIST_FOREACH(l, &srv->listeners, list)
+			kore_platform_event_schedule(l->fd, EPOLLIN, 0, l);
+	}
 }
 
 void
 kore_platform_disable_accept(void)
 {
 	struct listener		*l;
+	struct kore_server	*srv;
 
-	kore_debug("kore_platform_disable_accept()");
-
-	LIST_FOREACH(l, &listeners, list) {
-		if (epoll_ctl(efd, EPOLL_CTL_DEL, l->fd, NULL) == -1)
-			fatal("kore_platform_disable_accept: %s", errno_s);
+	LIST_FOREACH(srv, &kore_servers, list) {
+		LIST_FOREACH(l, &srv->listeners, list) {
+			if (epoll_ctl(efd, EPOLL_CTL_DEL, l->fd, NULL) == -1) {
+				fatal("kore_platform_disable_accept: %s",
+				    errno_s);
+			}
+		}
 	}
 }
 
 void
-kore_platform_proctitle(char *title)
+kore_platform_proctitle(const char *title)
 {
 	kore_proctitle(title);
 }
@@ -248,3 +257,24 @@ resend:
 	return (KORE_RESULT_OK);
 }
 #endif
+
+void
+kore_platform_sandbox(void)
+{
+	kore_seccomp_enable();
+}
+
+u_int32_t
+kore_platform_random_uint32(void)
+{
+	ssize_t		ret;
+	u_int32_t	val;
+
+	if ((ret = getrandom(&val, sizeof(val), 0)) == -1)
+		fatalx("getrandom(): %s", errno_s);
+
+	if ((size_t)ret != sizeof(val))
+		fatalx("getrandom() %zd != %zu", ret, sizeof(val));
+
+	return (val);
+}

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2014-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -25,6 +25,10 @@
 #define KORE_PGSQL_SYNC			0x0001
 #define KORE_PGSQL_ASYNC		0x0002
 #define KORE_PGSQL_SCHEDULED		0x0004
+
+#define KORE_PGSQL_PARAM_BINARY(v, l)	v, l, 1
+#define KORE_PGSQL_PARAM_TEXT_LEN(v, l)	v, l, 0
+#define KORE_PGSQL_PARAM_TEXT(v)	v, strlen(v), 0
 
 #if defined(__cplusplus)
 extern "C" {
@@ -81,11 +85,13 @@ int	kore_pgsql_setup(struct kore_pgsql *, const char *, int);
 void	kore_pgsql_handle(void *, int);
 void	kore_pgsql_cleanup(struct kore_pgsql *);
 void	kore_pgsql_continue(struct kore_pgsql *);
-int	kore_pgsql_query(struct kore_pgsql *, const char *);
+int	kore_pgsql_query(struct kore_pgsql *, const void *);
 int	kore_pgsql_query_params(struct kore_pgsql *,
-	    const char *, int, int, ...);
+	    const void *, int, int, ...);
 int	kore_pgsql_v_query_params(struct kore_pgsql *,
-	    const char *, int, int, va_list);
+	    const void *, int, int, va_list);
+int	kore_pgsql_query_param_fields(struct kore_pgsql *, const void *,
+	    int, int, const char **, int *, int *);
 int	kore_pgsql_register(const char *, const char *);
 int	kore_pgsql_ntuples(struct kore_pgsql *);
 int	kore_pgsql_nfields(struct kore_pgsql *);
@@ -93,6 +99,7 @@ void	kore_pgsql_logerror(struct kore_pgsql *);
 char	*kore_pgsql_fieldname(struct kore_pgsql *, int);
 char	*kore_pgsql_getvalue(struct kore_pgsql *, int, int);
 int	kore_pgsql_getlength(struct kore_pgsql *, int, int);
+int	kore_pgsql_column_binary(struct kore_pgsql *, int);
 
 #if defined(__cplusplus)
 }

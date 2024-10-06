@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2017-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -27,12 +27,20 @@
 #include "python_api.h"
 #endif
 
+#if defined(KORE_USE_LUA)
+#include "lua_api.h"
+#endif
+
 static void	native_runtime_execute(void *);
 static int	native_runtime_onload(void *, int);
+static void	native_runtime_signal(void *, int);
 static void	native_runtime_connect(void *, struct connection *);
 static void	native_runtime_configure(void *, int, char **);
 #if !defined(KORE_NO_HTTP)
 static int	native_runtime_http_request(void *, struct http_request *);
+static void	native_runtime_http_request_free(void *, struct http_request *);
+static void	native_runtime_http_body_chunk(void *, struct http_request *,
+		    const void *, size_t);
 static int	native_runtime_validator(void *, struct http_request *,
 		    const void *);
 
@@ -44,16 +52,54 @@ struct kore_runtime kore_native_runtime = {
 	KORE_RUNTIME_NATIVE,
 #if !defined(KORE_NO_HTTP)
 	.http_request = native_runtime_http_request,
+	.http_request_free = native_runtime_http_request_free,
+	.http_body_chunk = native_runtime_http_body_chunk,
 	.validator = native_runtime_validator,
 	.wsconnect = native_runtime_connect,
 	.wsmessage = native_runtime_wsmessage,
 	.wsdisconnect = native_runtime_connect,
 #endif
 	.onload = native_runtime_onload,
+	.signal = native_runtime_signal,
 	.connect = native_runtime_connect,
 	.execute = native_runtime_execute,
 	.configure = native_runtime_configure
 };
+
+static struct kore_runtime *runtimes[] = {
+#if defined(KORE_USE_PYTHON)
+	&kore_python_runtime,
+#endif
+#if defined(KORE_USE_LUA)
+	&kore_lua_runtime,
+#endif
+	NULL
+};
+
+size_t
+kore_runtime_count(void)
+{
+	return ((sizeof(runtimes) / sizeof(runtimes[0])) - 1);
+}
+
+void
+kore_runtime_resolve(const char *module, const struct stat *st)
+{
+	int		i;
+
+	if (runtimes[0] == NULL)
+		return;
+
+	for (i = 0; runtimes[i] != NULL; i++) {
+		if (runtimes[i]->resolve == NULL)
+			continue;
+		if (runtimes[i]->resolve(module, st))
+			break;
+	}
+
+	if (runtimes[i] == NULL)
+		fatal("No runtime available to run '%s'", module);
+}
 
 struct kore_runtime_call *
 kore_runtime_getcall(const char *symbol)
@@ -97,12 +143,32 @@ kore_runtime_connect(struct kore_runtime_call *rcall, struct connection *c)
 	rcall->runtime->connect(rcall->addr, c);
 }
 
+void
+kore_runtime_signal(struct kore_runtime_call *rcall, int sig)
+{
+	rcall->runtime->signal(rcall->addr, sig);
+}
+
 #if !defined(KORE_NO_HTTP)
 int
 kore_runtime_http_request(struct kore_runtime_call *rcall,
     struct http_request *req)
 {
 	return (rcall->runtime->http_request(rcall->addr, req));
+}
+
+void
+kore_runtime_http_request_free(struct kore_runtime_call *rcall,
+    struct http_request *req)
+{
+	rcall->runtime->http_request_free(rcall->addr, req);
+}
+
+void
+kore_runtime_http_body_chunk(struct kore_runtime_call *rcall,
+    struct http_request *req, const void *data, size_t len)
+{
+	rcall->runtime->http_body_chunk(rcall->addr, req, data, len);
 }
 
 int
@@ -168,6 +234,15 @@ native_runtime_onload(void *addr, int action)
 	return (cb(action));
 }
 
+static void
+native_runtime_signal(void *addr, int sig)
+{
+	void	(*cb)(int);
+
+	*(void **)&(cb) = addr;
+	cb(sig);
+}
+
 #if !defined(KORE_NO_HTTP)
 static int
 native_runtime_http_request(void *addr, struct http_request *req)
@@ -176,6 +251,26 @@ native_runtime_http_request(void *addr, struct http_request *req)
 
 	*(void **)&(cb) = addr;
 	return (cb(req));
+}
+
+static void
+native_runtime_http_request_free(void *addr, struct http_request *req)
+{
+	int		(*cb)(struct http_request *);
+
+	*(void **)&(cb) = addr;
+	cb(req);
+}
+
+static void
+native_runtime_http_body_chunk(void *addr, struct http_request *req,
+    const void *data, size_t len)
+{
+	void	(*cb)(struct http_request *, const void *, size_t);
+
+	*(void **)&(cb) = addr;
+
+	cb(req, data, len);
 }
 
 static int

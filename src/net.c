@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -15,6 +15,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 
 #if defined(__linux__)
@@ -44,7 +45,6 @@ net_init(void)
 void
 net_cleanup(void)
 {
-	kore_debug("net_cleanup()");
 	kore_pool_cleanup(&nb_pool);
 }
 
@@ -81,8 +81,6 @@ net_send_queue(struct connection *c, const void *data, size_t len)
 	const u_int8_t		*d;
 	struct netbuf		*nb;
 	size_t			avail;
-
-	kore_debug("net_send_queue(%p, %p, %zu)", c, data, len);
 
 	d = data;
 	nb = TAILQ_LAST(&(c->send_queue), netbuf_head);
@@ -127,8 +125,6 @@ net_send_stream(struct connection *c, void *data, size_t len,
 {
 	struct netbuf		*nb;
 
-	kore_debug("net_send_stream(%p, %p, %zu)", c, data, len);
-
 	nb = net_netbuf_get();
 	nb->cb = cb;
 	nb->owner = c;
@@ -156,8 +152,15 @@ net_send_fileref(struct connection *c, struct kore_fileref *ref)
 	nb->flags = NETBUF_IS_FILEREF;
 
 #if defined(KORE_USE_PLATFORM_SENDFILE)
-	nb->fd_off = 0;
-	nb->fd_len = ref->size;
+	if (c->owner->server->tls == 0) {
+		nb->fd_off = 0;
+		nb->fd_len = ref->size;
+	} else {
+		nb->buf = ref->base;
+		nb->b_len = ref->size;
+		nb->m_len = nb->b_len;
+		nb->flags |= NETBUF_IS_STREAM;
+	}
 #else
 	nb->buf = ref->base;
 	nb->b_len = ref->size;
@@ -171,8 +174,6 @@ net_send_fileref(struct connection *c, struct kore_fileref *ref)
 void
 net_recv_reset(struct connection *c, size_t len, int (*cb)(struct netbuf *))
 {
-	kore_debug("net_recv_reset(): %p %zu", c, len);
-
 	c->rnb->cb = cb;
 	c->rnb->s_off = 0;
 	c->rnb->b_len = len;
@@ -190,8 +191,6 @@ void
 net_recv_queue(struct connection *c, size_t len, int flags,
     int (*cb)(struct netbuf *))
 {
-	kore_debug("net_recv_queue(): %p %zu %d", c, len, flags);
-
 	if (c->rnb != NULL)
 		fatal("net_recv_queue(): called incorrectly");
 
@@ -208,8 +207,6 @@ net_recv_queue(struct connection *c, size_t len, int flags,
 void
 net_recv_expand(struct connection *c, size_t len, int (*cb)(struct netbuf *))
 {
-	kore_debug("net_recv_expand(): %p %d", c, len);
-
 	c->rnb->cb = cb;
 	c->rnb->b_len += len;
 	c->rnb->m_len = c->rnb->b_len;
@@ -255,8 +252,6 @@ net_send(struct connection *c)
 int
 net_send_flush(struct connection *c)
 {
-	kore_debug("net_send_flush(%p)", c);
-
 	while (!TAILQ_EMPTY(&(c->send_queue)) &&
 	    (c->evt.flags & KORE_EVENT_WRITE)) {
 		if (!net_send(c))
@@ -275,13 +270,14 @@ net_recv_flush(struct connection *c)
 {
 	size_t		r;
 
-	kore_debug("net_recv_flush(%p)", c);
-
 	if (c->rnb == NULL)
 		return (KORE_RESULT_OK);
 
 	while (c->evt.flags & KORE_EVENT_READ) {
 		if (c->rnb->buf == NULL)
+			return (KORE_RESULT_OK);
+
+		if ((c->rnb->b_len - c->rnb->s_off) == 0)
 			return (KORE_RESULT_OK);
 
 		if (!c->read(c, &r))
@@ -304,13 +300,10 @@ net_recv_flush(struct connection *c)
 void
 net_remove_netbuf(struct connection *c, struct netbuf *nb)
 {
-	kore_debug("net_remove_netbuf(%p, %p)", c, nb);
-
 	if (nb->type == NETBUF_RECV)
 		fatal("net_remove_netbuf(): cannot remove recv netbuf");
 
 	if (nb->flags & NETBUF_MUST_RESEND) {
-		kore_debug("retaining %p (MUST_RESEND)", nb);
 		nb->flags |= NETBUF_FORCE_REMOVE;
 		return;
 	}
@@ -329,102 +322,12 @@ net_remove_netbuf(struct connection *c, struct netbuf *nb)
 	kore_pool_put(&nb_pool, nb);
 }
 
-#if !defined(KORE_NO_TLS)
-int
-net_write_tls(struct connection *c, size_t len, size_t *written)
-{
-	int		r;
-
-	if (len > INT_MAX)
-		return (KORE_RESULT_ERROR);
-
-	ERR_clear_error();
-	r = SSL_write(c->ssl, (c->snb->buf + c->snb->s_off), len);
-	if (c->tls_reneg > 1)
-		return (KORE_RESULT_ERROR);
-
-	if (r <= 0) {
-		r = SSL_get_error(c->ssl, r);
-		switch (r) {
-		case SSL_ERROR_WANT_READ:
-		case SSL_ERROR_WANT_WRITE:
-			c->evt.flags &= ~KORE_EVENT_WRITE;
-			c->snb->flags |= NETBUF_MUST_RESEND;
-			return (KORE_RESULT_OK);
-		case SSL_ERROR_SYSCALL:
-			switch (errno) {
-			case EINTR:
-				*written = 0;
-				return (KORE_RESULT_OK);
-			case EAGAIN:
-				c->evt.flags &= ~KORE_EVENT_WRITE;
-				c->snb->flags |= NETBUF_MUST_RESEND;
-				return (KORE_RESULT_OK);
-			default:
-				break;
-			}
-			/* FALLTHROUGH */
-		default:
-			kore_debug("SSL_write(): %s", ssl_errno_s);
-			return (KORE_RESULT_ERROR);
-		}
-	}
-
-	*written = (size_t)r;
-
-	return (KORE_RESULT_OK);
-}
-
-int
-net_read_tls(struct connection *c, size_t *bytes)
-{
-	int		r;
-
-	ERR_clear_error();
-	r = SSL_read(c->ssl, (c->rnb->buf + c->rnb->s_off),
-	    (c->rnb->b_len - c->rnb->s_off));
-
-	if (c->tls_reneg > 1)
-		return (KORE_RESULT_ERROR);
-
-	if (r <= 0) {
-		r = SSL_get_error(c->ssl, r);
-		switch (r) {
-		case SSL_ERROR_WANT_READ:
-		case SSL_ERROR_WANT_WRITE:
-			c->evt.flags &= ~KORE_EVENT_READ;
-			return (KORE_RESULT_OK);
-		case SSL_ERROR_SYSCALL:
-			switch (errno) {
-			case EINTR:
-				*bytes = 0;
-				return (KORE_RESULT_OK);
-			case EAGAIN:
-				c->evt.flags &= ~KORE_EVENT_READ;
-				c->snb->flags |= NETBUF_MUST_RESEND;
-				return (KORE_RESULT_OK);
-			default:
-				break;
-			}
-			/* FALLTHROUGH */
-		default:
-			kore_debug("SSL_read(): %s", ssl_errno_s);
-			return (KORE_RESULT_ERROR);
-		}
-	}
-
-	*bytes = (size_t)r;
-
-	return (KORE_RESULT_OK);
-}
-#endif
-
 int
 net_write(struct connection *c, size_t len, size_t *written)
 {
 	ssize_t		r;
 
-	r = write(c->fd, (c->snb->buf + c->snb->s_off), len);
+	r = send(c->fd, (c->snb->buf + c->snb->s_off), len, 0);
 	if (r == -1) {
 		switch (errno) {
 		case EINTR:
@@ -434,7 +337,6 @@ net_write(struct connection *c, size_t len, size_t *written)
 			c->evt.flags &= ~KORE_EVENT_WRITE;
 			return (KORE_RESULT_OK);
 		default:
-			kore_debug("write: %s", errno_s);
 			return (KORE_RESULT_ERROR);
 		}
 	}
@@ -449,8 +351,8 @@ net_read(struct connection *c, size_t *bytes)
 {
 	ssize_t		r;
 
-	r = read(c->fd, (c->rnb->buf + c->rnb->s_off),
-	    (c->rnb->b_len - c->rnb->s_off));
+	r = recv(c->fd, (c->rnb->buf + c->rnb->s_off),
+	    (c->rnb->b_len - c->rnb->s_off), 0);
 	if (r == -1) {
 		switch (errno) {
 		case EINTR:
@@ -460,7 +362,6 @@ net_read(struct connection *c, size_t *bytes)
 			c->evt.flags &= ~KORE_EVENT_READ;
 			return (KORE_RESULT_OK);
 		default:
-			kore_debug("read(): %s", errno_s);
 			return (KORE_RESULT_ERROR);
 		}
 	}

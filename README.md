@@ -1,11 +1,18 @@
 About
 -----
 
-Kore (https://kore.io) is an easy to use web application platform for
-writing scalable web APIs in C. Its main goals are security, scalability
-and allowing rapid development and deployment of such APIs.
+Kore (https://kore.io) is a web application platform for writing scalable,
+concurrent web based processes in C or Python.
 
-Because of this Kore is an ideal candidate for building robust, scalable and secure web things.
+It is built with a "secure by default" approach. It is fully privilege
+separated while using strong security features at the operating system level
+such as seccomp, pledge, unveil and more.
+
+Today Kore is used in a variety of applications ranging from high assurance
+cryptographic devices, machine-learning stacks and even in the aerospace
+industry.
+
+From embedded platforms all the way to high performance servers. *Kore scales.*
 
 Key Features
 ------------
@@ -19,13 +26,15 @@ Key Features
 * Optional asynchronous PostgreSQL support
 * Optional support for page handlers in Python
 * Reload private keys and certificates on-the-fly
+* Automatic X509 certificates via ACME (with privsep)
 * Private keys isolated in separate process (RSA and ECDSA)
 * Default sane TLS ciphersuites (PFS in all major browsers)
 * Modules can be reloaded on-the-fly, even while serving content
+* Worker processes sandboxed on OpenBSD (pledge) and Linux (seccomp)
 * Event driven (epoll/kqueue) architecture with per CPU worker processes
 * Build your web application as a precompiled dynamic library or single binary
 
-And loads more.
+And lots more.
 
 License
 -------
@@ -33,7 +42,7 @@ License
 
 Documentation
 --------------
-[Read the documentation](https://docs.kore.io/3.2.0/)
+[Read the documentation](https://docs.kore.io/4.2.0/)
 
 Performance
 -----------
@@ -46,14 +55,17 @@ Platforms supported
 * FreeBSD
 * MacOS
 
+Kore only supports x64, arm and aarch64 architectures.
+
 Building Kore
 -------------
-Clone this repository or get the latest release at [https://kore.io/releases/3.2.0](https://kore.io/releases/3.2.0).
+Clone this repository or get the latest release at [https://kore.io/releases/4.2.3](https://kore.io/releases/4.2.3).
 
 Requirements
-* openssl (1.0.2, 1.1.0 or 1.1.1)
-  (note: this requirement drops away when building with NOTLS=1 NOHTTP=1)
-  (note: libressl works as a replacement)
+* openssl 1.1.1, libressl 3.x or openssl 3.
+
+Requirement for asynchronous curl (optional)
+* libcurl (7.64.0 or higher)
 
 Requirements for background tasks (optional)
 * pthreads
@@ -63,6 +75,9 @@ Requirements for pgsql (optional)
 
 Requirements for python (optional)
 * Python 3.6+
+
+Requirements for lua support (optional)
+* Lua 5.4+
 
 Normal compilation and installation:
 
@@ -75,14 +90,17 @@ $ make
 If you would like to build a specific flavor, you can enable
 those by setting a shell environment variable before running **_make_**.
 
+* LUA=1 (compiles in LUA support)
+* ACME=1 (compiles in ACME support)
+* CURL=1 (compiles in asynchronous curl support)
 * TASKS=1 (compiles in task support)
 * PGSQL=1 (compiles in pgsql support)
 * DEBUG=1 (enables use of -d for debug)
-* NOTLS=1 (compiles Kore without TLS)
 * NOHTTP=1 (compiles Kore without HTTP support)
 * NOOPT=1 (disable compiler optimizations)
 * JSONRPC=1 (compiles in JSONRPC support)
 * PYTHON=1 (compiles in the Python support)
+* TLS_BACKEND=none (compiles Kore without any TLS backend)
 
 Note that certain build flavors cannot be mixed together and you will just
 be met with compilation errors.

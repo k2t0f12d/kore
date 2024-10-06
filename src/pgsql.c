@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2014-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -27,6 +27,22 @@
 #endif
 
 #include "pgsql.h"
+
+#if defined(__linux__)
+#include "seccomp.h"
+
+static struct sock_filter filter_pgsql[] = {
+	/* Allow us to create sockets and call connect. */
+	KORE_SYSCALL_ALLOW(connect),
+	KORE_SYSCALL_ALLOW_ARG(socket, 0, AF_INET),
+	KORE_SYSCALL_ALLOW_ARG(socket, 0, AF_INET6),
+	KORE_SYSCALL_ALLOW_ARG(socket, 0, AF_UNIX),
+
+	/* Requires these calls. */
+	KORE_SYSCALL_ALLOW(getsockopt),
+	KORE_SYSCALL_ALLOW(getsockname),
+};
+#endif
 
 struct pgsql_wait {
 	struct kore_pgsql	*pgsql;
@@ -79,6 +95,11 @@ kore_pgsql_sys_init(void)
 	    sizeof(struct pgsql_job), 100);
 	kore_pool_init(&pgsql_wait_pool, "pgsql_wait_pool",
 	    sizeof(struct pgsql_wait), pgsql_queue_limit);
+
+#if defined(__linux__)
+	kore_seccomp_filter("pgsql", filter_pgsql,
+	    KORE_FILTER_LEN(filter_pgsql));
+#endif
 }
 
 void
@@ -172,7 +193,7 @@ kore_pgsql_bind_callback(struct kore_pgsql *pgsql,
 }
 
 int
-kore_pgsql_query(struct kore_pgsql *pgsql, const char *query)
+kore_pgsql_query(struct kore_pgsql *pgsql, const void *query)
 {
 	if (pgsql->conn == NULL) {
 		pgsql_set_error(pgsql, "no connection was set before query");
@@ -202,10 +223,10 @@ kore_pgsql_query(struct kore_pgsql *pgsql, const char *query)
 
 int
 kore_pgsql_v_query_params(struct kore_pgsql *pgsql,
-    const char *query, int result, int count, va_list args)
+    const void *query, int binary, int count, va_list args)
 {
-	u_int8_t	i;
-	char		**values;
+	int		i;
+	const char	**values;
 	int		*lengths, *formats, ret;
 
 	if (pgsql->conn == NULL) {
@@ -229,33 +250,9 @@ kore_pgsql_v_query_params(struct kore_pgsql *pgsql,
 		values = NULL;
 	}
 
-	ret = KORE_RESULT_ERROR;
+	ret = kore_pgsql_query_param_fields(pgsql, query, binary, count,
+	    values, lengths, formats);
 
-	if (pgsql->flags & KORE_PGSQL_SYNC) {
-		pgsql->result = PQexecParams(pgsql->conn->db, query, count,
-		    NULL, (const char * const *)values, lengths, formats,
-		    result);
-
-		if ((PQresultStatus(pgsql->result) != PGRES_TUPLES_OK) &&
-		    (PQresultStatus(pgsql->result) != PGRES_COMMAND_OK)) {
-			pgsql_set_error(pgsql, PQerrorMessage(pgsql->conn->db));
-			goto cleanup;
-		}
-
-		pgsql->state = KORE_PGSQL_STATE_DONE;
-	} else {
-		if (!PQsendQueryParams(pgsql->conn->db, query, count, NULL,
-		    (const char * const *)values, lengths, formats, result)) {
-			pgsql_set_error(pgsql, PQerrorMessage(pgsql->conn->db));
-			goto cleanup;
-		}
-
-		pgsql_schedule(pgsql);
-	}
-
-	ret = KORE_RESULT_OK;
-
-cleanup:
 	kore_free(values);
 	kore_free(lengths);
 	kore_free(formats);
@@ -264,14 +261,48 @@ cleanup:
 }
 
 int
+kore_pgsql_query_param_fields(struct kore_pgsql *pgsql, const void *query,
+    int binary, int count, const char **values, int *lengths, int *formats)
+{
+	if (pgsql->conn == NULL) {
+		pgsql_set_error(pgsql, "no connection was set before query");
+		return (KORE_RESULT_ERROR);
+	}
+
+	if (pgsql->flags & KORE_PGSQL_SYNC) {
+		pgsql->result = PQexecParams(pgsql->conn->db, query, count,
+		    NULL, (const char * const *)values, lengths, formats,
+		    binary);
+
+		if ((PQresultStatus(pgsql->result) != PGRES_TUPLES_OK) &&
+		    (PQresultStatus(pgsql->result) != PGRES_COMMAND_OK)) {
+			pgsql_set_error(pgsql, PQerrorMessage(pgsql->conn->db));
+			return (KORE_RESULT_ERROR);
+		}
+
+		pgsql->state = KORE_PGSQL_STATE_DONE;
+	} else {
+		if (!PQsendQueryParams(pgsql->conn->db, query, count, NULL,
+		    (const char * const *)values, lengths, formats, binary)) {
+			pgsql_set_error(pgsql, PQerrorMessage(pgsql->conn->db));
+			return (KORE_RESULT_ERROR);
+		}
+
+		pgsql_schedule(pgsql);
+	}
+
+	return (KORE_RESULT_OK);
+}
+
+int
 kore_pgsql_query_params(struct kore_pgsql *pgsql,
-    const char *query, int result, int count, ...)
+    const void *query, int binary, int count, ...)
 {
 	int		ret;
 	va_list		args;
 
 	va_start(args, count);
-	ret = kore_pgsql_v_query_params(pgsql, query, result, count, args);
+	ret = kore_pgsql_v_query_params(pgsql, query, binary, count, args);
 	va_end(args);
 
 	return (ret);
@@ -313,12 +344,7 @@ kore_pgsql_handle(void *c, int err)
 
 	pgsql = conn->job->pgsql;
 
-	if (!PQconsumeInput(conn->db)) {
-		pgsql->state = KORE_PGSQL_STATE_ERROR;
-		pgsql->error = kore_strdup(PQerrorMessage(conn->db));
-	} else {
-		pgsql_read_result(pgsql);
-	}
+	pgsql_read_result(pgsql);
 
 	if (pgsql->state == KORE_PGSQL_STATE_WAIT) {
 #if !defined(KORE_NO_HTTP)
@@ -430,6 +456,12 @@ char *
 kore_pgsql_getvalue(struct kore_pgsql *pgsql, int row, int col)
 {
 	return (PQgetvalue(pgsql->result, row, col));
+}
+
+int
+kore_pgsql_column_binary(struct kore_pgsql *pgsql, int col)
+{
+	return (PQfformat(pgsql->result, col));
 }
 
 static struct pgsql_conn *
@@ -696,14 +728,33 @@ pgsql_conn_cleanup(struct pgsql_conn *conn)
 static void
 pgsql_read_result(struct kore_pgsql *pgsql)
 {
-	PGnotify	*notify;
+	struct pgsql_conn	*conn;
+	PGnotify		*notify;
+	int			saved_errno;
 
-	if (PQisBusy(pgsql->conn->db)) {
-		pgsql->state = KORE_PGSQL_STATE_WAIT;
-		return;
+	conn = pgsql->conn;
+
+	for (;;) {
+		if (!PQconsumeInput(conn->db)) {
+			pgsql->state = KORE_PGSQL_STATE_ERROR;
+			pgsql->error = kore_strdup(PQerrorMessage(conn->db));
+			return;
+		}
+
+		saved_errno = errno;
+
+		if (PQisBusy(conn->db)) {
+			if (saved_errno != EAGAIN && saved_errno != EWOULDBLOCK)
+				continue;
+			pgsql->state = KORE_PGSQL_STATE_WAIT;
+			conn->evt.flags &= ~KORE_EVENT_READ;
+			return;
+		}
+
+		break;
 	}
 
-	while ((notify = PQnotifies(pgsql->conn->db)) != NULL) {
+	while ((notify = PQnotifies(conn->db)) != NULL) {
 		pgsql->state = KORE_PGSQL_STATE_NOTIFY;
 		pgsql->notify.extra = notify->extra;
 		pgsql->notify.channel = notify->relname;
@@ -714,13 +765,17 @@ pgsql_read_result(struct kore_pgsql *pgsql)
 		PQfreemem(notify);
 	}
 
-	pgsql->result = PQgetResult(pgsql->conn->db);
+	pgsql->result = PQgetResult(conn->db);
 	if (pgsql->result == NULL) {
 		pgsql->state = KORE_PGSQL_STATE_DONE;
 		return;
 	}
 
 	switch (PQresultStatus(pgsql->result)) {
+#if PG_VERSION_NUM >= 140000
+	case PGRES_PIPELINE_SYNC:
+	case PGRES_PIPELINE_ABORTED:
+#endif
 	case PGRES_COPY_OUT:
 	case PGRES_COPY_IN:
 	case PGRES_NONFATAL_ERROR:

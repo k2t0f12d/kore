@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 
 #include <time.h>
+#include <inttypes.h>
 #include <signal.h>
 
 #include "kore.h"
@@ -48,10 +49,6 @@ static void	accesslog_flush(struct kore_domain *, u_int64_t, int);
 static u_int64_t	time_cache = 0;
 static char		tbuf[128] = { '\0' };
 
-#if !defined(KORE_NO_TLS)
-char			cnbuf[1024] = { '\0' };
-#endif
-
 static struct kore_buf	*logbuf = NULL;
 
 void
@@ -70,8 +67,8 @@ kore_accesslog(struct http_request *req)
 	size_t			avail;
 	time_t			curtime;
 	int			len, attempts;
-	char			addr[INET6_ADDRSTRLEN];
-	const char		*ptr, *method, *cn, *referer;
+	char			addr[INET6_ADDRSTRLEN], *cn_value;
+	const char		*ptr, *method, *http_version, *cn, *referer;
 
 	switch (req->method) {
 	case HTTP_METHOD_GET:
@@ -97,18 +94,27 @@ kore_accesslog(struct http_request *req)
 		break;
 	}
 
+	if (req->flags & HTTP_VERSION_1_0)
+		http_version = "HTTP/1.0";
+	else
+		http_version = "HTTP/1.1";
+
 	if (req->referer != NULL)
 		referer = req->referer;
 	else
 		referer = "-";
 
+	if (req->agent == NULL)
+		req->agent = "-";
+
 	cn = "-";
-#if !defined(KORE_NO_TLS)
-	if (req->owner->cert != NULL) {
-		if (X509_GET_CN(req->owner->cert, cnbuf, sizeof(cnbuf)) != -1)
-			cn = cnbuf;
+	cn_value = NULL;
+
+	if (req->owner->tls_cert != NULL) {
+		if (kore_x509_subject_name(req->owner, &cn_value,
+		    KORE_X509_COMMON_NAME_ONLY))
+			cn = cn_value;
 	}
-#endif
 
 	switch (req->owner->family) {
 	case AF_INET:
@@ -168,9 +174,9 @@ kore_accesslog(struct http_request *req)
 		worker->lb.offset += sizeof(*hdr);
 
 		len = snprintf(worker->lb.buf + worker->lb.offset, avail,
-		    "%s - %s [%s] \"%s %s HTTP/1.1\" %d %zu \"%s\" \"%s\"\n",
-		    addr, cn, tbuf, method, req->path, req->status,
-		    req->content_length, referer, req->agent);
+		    "%s - %s [%s] \"%s %s %s\" %d %" PRIu64" \"%s\" \"%s\"\n",
+		    addr, cn, tbuf, method, req->path, http_version,
+		    req->status, req->content_length, referer, req->agent);
 		if (len == -1)
 			fatal("failed to create log entry");
 
@@ -189,12 +195,13 @@ kore_accesslog(struct http_request *req)
 		}
 
 		hdr->loglen = len;
-		hdr->domain = req->hdlr->dom->id;
+		hdr->domain = req->rt->dom->id;
 
 		worker->lb.offset += (size_t)len;
 		break;
 	}
 
+	kore_free(cn_value);
 	accesslog_unlock(worker);
 }
 
@@ -210,7 +217,7 @@ kore_accesslog_gather(void *arg, u_int64_t now, int force)
 	if (logbuf == NULL)
 		logbuf = kore_buf_alloc(LOGBUF_SIZE);
 
-	for (id = 0; id < worker_count; id++) {
+	for (id = KORE_WORKER_BASE; id < worker_count; id++) {
 		kw = kore_worker_data(id);
 
 		accesslog_lock(kw);

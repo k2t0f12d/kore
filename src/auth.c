@@ -35,7 +35,7 @@ kore_auth_new(const char *name)
 {
 	struct kore_auth	*auth;
 
-	if ((auth = kore_auth_lookup(name)) != NULL)
+	if (kore_auth_lookup(name) != NULL)
 		return (KORE_RESULT_ERROR);
 
 	auth = kore_malloc(sizeof(*auth));
@@ -55,8 +55,6 @@ kore_auth_run(struct http_request *req, struct kore_auth *auth)
 {
 	int		r;
 
-	kore_debug("kore_auth(%p, %p)", req, auth);
-
 	switch (auth->type) {
 	case KORE_AUTH_TYPE_COOKIE:
 		r = kore_auth_cookie(req, auth);
@@ -75,7 +73,6 @@ kore_auth_run(struct http_request *req, struct kore_auth *auth)
 	switch (r) {
 	case KORE_RESULT_OK:
 		req->flags |= HTTP_REQUEST_AUTHED;
-		kore_debug("kore_auth_run() for %s successful", req->path);
 		/* FALLTHROUGH */
 	case KORE_RESULT_RETRY:
 		return (r);
@@ -87,15 +84,13 @@ kore_auth_run(struct http_request *req, struct kore_auth *auth)
 	if (auth->type == KORE_AUTH_TYPE_REQUEST)
 		return (r);
 
-	kore_debug("kore_auth_run() for %s failed", req->path);
-
 	if (auth->redirect == NULL) {
-		http_response(req, 403, NULL, 0);
+		http_response(req, HTTP_STATUS_FORBIDDEN, NULL, 0);
 		return (KORE_RESULT_ERROR);
 	}
 
 	http_response_header(req, "location", auth->redirect);
-	http_response(req, 302, NULL, 0);
+	http_response(req, HTTP_STATUS_FOUND, NULL, 0);
 
 	return (KORE_RESULT_ERROR);
 }

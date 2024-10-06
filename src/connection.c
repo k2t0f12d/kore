@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -47,8 +47,6 @@ kore_connection_init(void)
 void
 kore_connection_cleanup(void)
 {
-	kore_debug("connection_cleanup()");
-
 	/* Drop all connections */
 	kore_connection_prune(KORE_CONNECTION_PRUNE_ALL);
 	kore_pool_cleanup(&connection_pool);
@@ -61,16 +59,17 @@ kore_connection_new(void *owner)
 
 	c = kore_pool_get(&connection_pool);
 
-#if !defined(KORE_NO_TLS)
-	c->ssl = NULL;
-	c->cert = NULL;
-	c->tls_reneg = 0;
-#endif
 	c->flags = 0;
 	c->rnb = NULL;
 	c->snb = NULL;
 	c->owner = owner;
 	c->handle = NULL;
+
+	c->tls = NULL;
+	c->tls_cert = NULL;
+	c->tls_reneg = 0;
+	c->tls_sni = NULL;
+
 	c->disconnect = NULL;
 	c->hdlr_extra = NULL;
 	c->proto = CONN_PROTO_UNKNOWN;
@@ -101,8 +100,6 @@ kore_connection_accept(struct listener *listener, struct connection **out)
 	struct sockaddr		*s;
 	socklen_t		len;
 
-	kore_debug("kore_connection_accept(%p)", listener);
-
 	*out = NULL;
 	c = kore_connection_new(listener);
 
@@ -127,7 +124,6 @@ kore_connection_accept(struct listener *listener, struct connection **out)
 
 	if ((c->fd = accept(listener->fd, s, &len)) == -1) {
 		kore_pool_put(&connection_pool, c);
-		kore_debug("accept(): %s", errno_s);
 		return (KORE_RESULT_ERROR);
 	}
 
@@ -146,27 +142,29 @@ kore_connection_accept(struct listener *listener, struct connection **out)
 	c->handle = kore_connection_handle;
 	TAILQ_INSERT_TAIL(&connections, c, list);
 
-#if !defined(KORE_NO_TLS)
-	c->state = CONN_STATE_TLS_SHAKE;
-	c->write = net_write_tls;
-	c->read = net_read_tls;
-#else
-	c->state = CONN_STATE_ESTABLISHED;
-	c->write = net_write;
-	c->read = net_read;
-
-	if (listener->connect != NULL) {
-		kore_runtime_connect(listener->connect, c);
+	if (listener->server->tls) {
+		c->state = CONN_STATE_TLS_SHAKE;
+		c->write = kore_tls_write;
+		c->read = kore_tls_read;
 	} else {
+		c->state = CONN_STATE_ESTABLISHED;
+		c->write = net_write;
+		c->read = net_read;
+
+		if (listener->connect != NULL) {
+			kore_runtime_connect(listener->connect, c);
+		} else {
 #if !defined(KORE_NO_HTTP)
-		c->proto = CONN_PROTO_HTTP;
-		if (http_keepalive_time != 0)
-			c->idle_timer.length = http_keepalive_time * 1000;
-		net_recv_queue(c, http_header_max,
-		    NETBUF_CALL_CB_ALWAYS, http_header_recv);
+			c->proto = CONN_PROTO_HTTP;
+			if (http_keepalive_time != 0) {
+				c->idle_timer.length =
+				    http_keepalive_time * 1000;
+			}
+			net_recv_queue(c, http_header_max,
+			    NETBUF_CALL_CB_ALWAYS, http_header_recv);
 #endif
+		}
 	}
-#endif
 
 	kore_connection_start_idletimer(c);
 	worker_active_connections++;
@@ -185,10 +183,13 @@ kore_connection_check_timeout(u_int64_t now)
 		if (c->proto == CONN_PROTO_MSG)
 			continue;
 #if !defined(KORE_NO_HTTP)
-		if (!http_check_timeout(c, now))
-			continue;
-		if (!TAILQ_EMPTY(&c->http_requests))
-			continue;
+		if (c->state == CONN_STATE_ESTABLISHED &&
+		    c->proto == CONN_PROTO_HTTP) {
+			if (!http_check_timeout(c, now))
+				continue;
+			if (!TAILQ_EMPTY(&c->http_requests))
+				continue;
+		}
 #endif
 		if (c->flags & CONN_IDLE_TIMER_ACT)
 			kore_connection_check_idletimer(now, c);
@@ -219,7 +220,6 @@ void
 kore_connection_disconnect(struct connection *c)
 {
 	if (c->state != CONN_STATE_DISCONNECTING) {
-		kore_debug("preparing %p for disconnection", c);
 		c->state = CONN_STATE_DISCONNECTING;
 		if (c->disconnect)
 			c->disconnect(c);
@@ -246,67 +246,19 @@ kore_connection_event(void *arg, int error)
 int
 kore_connection_handle(struct connection *c)
 {
-#if !defined(KORE_NO_TLS)
-	int			r;
 	struct listener		*listener;
-	char			cn[X509_CN_LENGTH];
-#endif
 
-	kore_debug("kore_connection_handle(%p) -> %d", c, c->state);
 	kore_connection_stop_idletimer(c);
 
 	switch (c->state) {
-#if !defined(KORE_NO_TLS)
 	case CONN_STATE_TLS_SHAKE:
-		if (primary_dom->ssl_ctx == NULL) {
-			kore_log(LOG_NOTICE,
-			    "TLS configuration for %s not yet complete",
-			    primary_dom->domain);
+		switch (kore_tls_connection_accept(c)) {
+		case KORE_RESULT_OK:
+			break;
+		case KORE_RESULT_RETRY:
+			return (KORE_RESULT_OK);
+		default:
 			return (KORE_RESULT_ERROR);
-		}
-
-		if (c->ssl == NULL) {
-			c->ssl = SSL_new(primary_dom->ssl_ctx);
-			if (c->ssl == NULL) {
-				kore_debug("SSL_new(): %s", ssl_errno_s);
-				return (KORE_RESULT_ERROR);
-			}
-
-			SSL_set_fd(c->ssl, c->fd);
-			SSL_set_accept_state(c->ssl);
-			SSL_set_app_data(c->ssl, c);
-		}
-
-		ERR_clear_error();
-		r = SSL_accept(c->ssl);
-		if (r <= 0) {
-			r = SSL_get_error(c->ssl, r);
-			switch (r) {
-			case SSL_ERROR_WANT_READ:
-			case SSL_ERROR_WANT_WRITE:
-				kore_connection_start_idletimer(c);
-				return (KORE_RESULT_OK);
-			default:
-				kore_debug("SSL_accept(): %s", ssl_errno_s);
-				return (KORE_RESULT_ERROR);
-			}
-		}
-
-		if (SSL_get_verify_mode(c->ssl) & SSL_VERIFY_PEER) {
-			c->cert = SSL_get_peer_certificate(c->ssl);
-			if (c->cert == NULL) {
-				kore_log(LOG_NOTICE,
-				    "no client certificate presented?");
-				return (KORE_RESULT_ERROR);
-			}
-
-			if (X509_GET_CN(c->cert, cn, sizeof(cn)) == -1) {
-				kore_log(LOG_NOTICE,
-				    "no CN found in client certificate");
-				return (KORE_RESULT_ERROR);
-			}
-		} else {
-			c->cert = NULL;
 		}
 
 		if (c->owner != NULL) {
@@ -331,7 +283,6 @@ kore_connection_handle(struct connection *c)
 
 		c->state = CONN_STATE_ESTABLISHED;
 		/* FALLTHROUGH */
-#endif /* !KORE_NO_TLS */
 	case CONN_STATE_ESTABLISHED:
 		if (c->evt.flags & KORE_EVENT_READ) {
 			if (!net_recv_flush(c))
@@ -346,7 +297,6 @@ kore_connection_handle(struct connection *c)
 	case CONN_STATE_DISCONNECTING:
 		break;
 	default:
-		kore_debug("unknown state on %d (%d)", c->fd, c->state);
 		break;
 	}
 
@@ -363,17 +313,7 @@ kore_connection_remove(struct connection *c)
 	struct http_request	*req, *rnext;
 #endif
 
-	kore_debug("kore_connection_remove(%p)", c);
-
-#if !defined(KORE_NO_TLS)
-	if (c->ssl != NULL) {
-		SSL_shutdown(c->ssl);
-		SSL_free(c->ssl);
-	}
-
-	if (c->cert != NULL)
-		X509_free(c->cert);
-#endif
+	kore_tls_connection_cleanup(c);
 
 	close(c->fd);
 
@@ -420,17 +360,13 @@ kore_connection_check_idletimer(u_int64_t now, struct connection *c)
 	else
 		d = 0;
 
-	if (d >= c->idle_timer.length) {
-		kore_debug("%p idle for %" PRIu64 " ms, expiring", c, d);
+	if (d >= c->idle_timer.length)
 		kore_connection_disconnect(c);
-	}
 }
 
 void
 kore_connection_start_idletimer(struct connection *c)
 {
-	kore_debug("kore_connection_start_idletimer(%p)", c);
-
 	c->flags |= CONN_IDLE_TIMER_ACT;
 	c->idle_timer.start = kore_time_ms();
 }
@@ -438,8 +374,6 @@ kore_connection_start_idletimer(struct connection *c)
 void
 kore_connection_stop_idletimer(struct connection *c)
 {
-	kore_debug("kore_connection_stop_idletimer(%p)", c);
-
 	c->flags &= ~CONN_IDLE_TIMER_ACT;
 	c->idle_timer.start = 0;
 }
@@ -449,18 +383,12 @@ kore_connection_nonblock(int fd, int nodelay)
 {
 	int		flags;
 
-	kore_debug("kore_connection_nonblock(%d)", fd);
-
-	if ((flags = fcntl(fd, F_GETFL, 0)) == -1) {
-		kore_debug("fcntl(): F_GETFL %s", errno_s);
+	if ((flags = fcntl(fd, F_GETFL, 0)) == -1)
 		return (KORE_RESULT_ERROR);
-	}
 
 	flags |= O_NONBLOCK;
-	if (fcntl(fd, F_SETFL, flags) == -1) {
-		kore_debug("fcntl(): F_SETFL %s", errno_s);
+	if (fcntl(fd, F_SETFL, flags) == -1)
 		return (KORE_RESULT_ERROR);
-	}
 
 	if (nodelay) {
 		if (!kore_sockopt(fd, IPPROTO_TCP, TCP_NODELAY)) {
@@ -470,4 +398,53 @@ kore_connection_nonblock(int fd, int nodelay)
 	}
 
 	return (KORE_RESULT_OK);
+}
+
+void
+kore_connection_log(struct connection *c, const char *fmt, ...)
+{
+	struct kore_buf		buf;
+	va_list			args;
+	char			*ptr;
+
+	kore_buf_init(&buf, 128);
+	kore_buf_appendf(&buf, "ip=[%s] msg=[", kore_connection_ip(c));
+
+	va_start(args, fmt);
+	kore_buf_appendv(&buf, fmt, args);
+	va_end(args);
+
+	kore_buf_appendf(&buf, "]");
+
+	ptr = kore_buf_stringify(&buf, NULL);
+	kore_log(LOG_NOTICE, "%s", ptr);
+	kore_free(ptr);
+}
+
+const char *
+kore_connection_ip(struct connection *c)
+{
+	static char	addr[INET6_ADDRSTRLEN];
+
+	memset(addr, 0, sizeof(addr));
+
+	switch (c->family) {
+	case AF_INET:
+		if (inet_ntop(c->family,
+		    &(c->addr.ipv4.sin_addr), addr, sizeof(addr)) == NULL)
+			fatal("inet_ntop: %s", errno_s);
+		break;
+	case AF_INET6:
+		if (inet_ntop(c->family,
+		    &(c->addr.ipv6.sin6_addr), addr, sizeof(addr)) == NULL)
+			fatal("inet_ntop: %s", errno_s);
+		break;
+	case AF_UNIX:
+		(void)kore_strlcpy(addr, "unix-socket", sizeof(addr));
+		break;
+	default:
+		fatal("unknown family %d", c->family);
+	}
+
+	return (addr);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2014-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,17 +17,15 @@
 #include <sys/param.h>
 #include <sys/types.h>
 
-#include <openssl/sha.h>
-
 #include <limits.h>
 #include <string.h>
 
 #include "kore.h"
 #include "http.h"
+#include "sha1.h"
 
 #define WEBSOCKET_FRAME_HDR		2
 #define WEBSOCKET_MASK_LEN		4
-#define WEBSOCKET_FRAME_MAXLEN		16384
 #define WEBSOCKET_PAYLOAD_SINGLE	125
 #define WEBSOCKET_PAYLOAD_EXTEND_1	126
 #define WEBSOCKET_PAYLOAD_EXTEND_2	127
@@ -53,11 +51,11 @@ void
 kore_websocket_handshake(struct http_request *req, const char *onconnect,
     const char *onmessage, const char *ondisconnect)
 {
-	SHA_CTX			sctx;
+	SHA1_CTX		sctx;
 	struct kore_buf		*buf;
 	char			*base64;
 	const char		*key, *version;
-	u_int8_t		digest[SHA_DIGEST_LENGTH];
+	u_int8_t		digest[SHA1_DIGEST_LENGTH];
 
 	if (!http_request_header(req, "sec-websocket-key", &key)) {
 		http_response(req, HTTP_STATUS_BAD_REQUEST, NULL, 0);
@@ -79,14 +77,13 @@ kore_websocket_handshake(struct http_request *req, const char *onconnect,
 	buf = kore_buf_alloc(128);
 	kore_buf_appendf(buf, "%s%s", key, WEBSOCKET_SERVER_RESPONSE);
 
-	(void)SHA1_Init(&sctx);
-	(void)SHA1_Update(&sctx, buf->data, buf->offset);
-	(void)SHA1_Final(digest, &sctx);
+	SHA1Init(&sctx);
+	SHA1Update(&sctx, buf->data, buf->offset);
+	SHA1Final(digest, &sctx);
 
 	kore_buf_free(buf);
 
 	if (!kore_base64_encode(digest, sizeof(digest), &base64)) {
-		kore_debug("failed to base64 encode digest");
 		http_response(req, HTTP_STATUS_INTERNAL_ERROR, NULL, 0);
 		return;
 	}
@@ -96,8 +93,6 @@ kore_websocket_handshake(struct http_request *req, const char *onconnect,
 	http_response_header(req, "sec-websocket-accept", base64);
 	kore_free(base64);
 
-	kore_debug("%p: new websocket connection", req->owner);
-
 	req->owner->proto = CONN_PROTO_WEBSOCKET;
 	http_response(req, HTTP_STATUS_SWITCHING_PROTOCOLS, NULL, 0);
 	net_recv_reset(req->owner, WEBSOCKET_FRAME_HDR, websocket_recv_opcode);
@@ -105,6 +100,7 @@ kore_websocket_handshake(struct http_request *req, const char *onconnect,
 	req->owner->disconnect = websocket_disconnect;
 	req->owner->rnb->flags &= ~NETBUF_CALL_CB_ALWAYS;
 
+	req->owner->http_timeout = 0;
 	req->owner->idle_timer.start = kore_time_ms();
 	req->owner->idle_timer.length = kore_websocket_timeout;
 
@@ -232,16 +228,12 @@ websocket_recv_opcode(struct netbuf *nb)
 	u_int8_t		op, len;
 	struct connection	*c = nb->owner;
 
-	if (!WEBSOCKET_HAS_MASK(nb->buf[1])) {
-		kore_debug("%p: frame did not have a mask set", c);
+	if (!WEBSOCKET_HAS_MASK(nb->buf[1]))
 		return (KORE_RESULT_ERROR);
-	}
 
 	if (WEBSOCKET_RSV(nb->buf[0], 1) || WEBSOCKET_RSV(nb->buf[0], 2) ||
-	    WEBSOCKET_RSV(nb->buf[0], 3)) {
-		kore_debug("%p: RSV bits are not zero", c);
+	    WEBSOCKET_RSV(nb->buf[0], 3))
 		return (KORE_RESULT_ERROR);
-	}
 
 	len = WEBSOCKET_FRAME_LENGTH(nb->buf[1]);
 
@@ -255,13 +247,10 @@ websocket_recv_opcode(struct netbuf *nb)
 	case WEBSOCKET_OP_PING:
 	case WEBSOCKET_OP_PONG:
 		if (len > WEBSOCKET_PAYLOAD_SINGLE ||
-		    !WEBSOCKET_HAS_FINFLAG(nb->buf[0])) {
-			kore_debug("%p: large or fragmented control frame", c);
+		    !WEBSOCKET_HAS_FINFLAG(nb->buf[0]))
 			return (KORE_RESULT_ERROR);
-		}
 		break;
 	default:
-		kore_debug("%p: bad websocket op %d", c, op);
 		return (KORE_RESULT_ERROR);
 	}
 
@@ -309,10 +298,8 @@ websocket_recv_frame(struct netbuf *nb)
 		break;
 	}
 
-	if (len > kore_websocket_maxframe) {
-		kore_debug("%p: frame too big", c);
+	if (len > kore_websocket_maxframe)
 		return (KORE_RESULT_ERROR);
-	}
 
 	extra += WEBSOCKET_FRAME_HDR;
 	total = len + extra + WEBSOCKET_MASK_LEN;
@@ -357,7 +344,6 @@ websocket_recv_frame(struct netbuf *nb)
 		    &nb->buf[moff + 4], len);
 		break;
 	default:
-		kore_debug("%p: bad websocket op %d", c, op);
 		return (KORE_RESULT_ERROR);
 	}
 

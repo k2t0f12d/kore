@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -28,69 +28,110 @@
 #include <signal.h>
 
 #include "kore.h"
+#include "hooks.h"
 
 #if !defined(KORE_NO_HTTP)
 #include "http.h"
+#endif
+
+#if defined(KORE_USE_CURL)
+#include "curl.h"
+#endif
+
+#if defined(KORE_USE_PGSQL)
+#include "pgsql.h"
 #endif
 
 #if defined(KORE_USE_PYTHON)
 #include "python_api.h"
 #endif
 
+#if defined(KORE_USE_LUA)
+#include "lua_api.h"
+#endif
+
+#if defined(KORE_USE_ACME)
+#include "acme.h"
+#endif
+
 volatile sig_atomic_t	sig_recv;
-struct listener_head	listeners;
+struct kore_server_list	kore_servers;
 u_int8_t		nlisteners;
 int			kore_argc = 0;
 pid_t			kore_pid = -1;
 u_int16_t		cpu_count = 1;
-int			foreground = 0;
-int			kore_debug = 0;
 int			kore_quiet = 0;
 int			skip_runas = 0;
 int			skip_chroot = 0;
 u_int8_t		worker_count = 0;
 char			**kore_argv = NULL;
+int			kore_mem_guard = 0;
+int			kore_foreground = 1;
 char			*kore_progname = NULL;
-char			*kore_root_path = NULL;
-char			*kore_runas_user = NULL;
 u_int32_t		kore_socket_backlog = 5000;
+int			kore_quit = KORE_QUIT_NONE;
 char			*kore_pidfile = KORE_PIDFILE_DEFAULT;
-char			*kore_tls_cipher_list = KORE_DEFAULT_CIPHER_LIST;
+
+struct kore_privsep	worker_privsep;
 
 extern char		**environ;
 extern char		*__progname;
+static size_t		proctitle_maxlen = 0;
 
 static void	usage(void);
 static void	version(void);
+
 static void	kore_write_kore_pid(void);
-static void	kore_server_sslstart(void);
+static void	kore_proctitle_setup(void);
+static void	kore_server_shutdown(void);
 static void	kore_server_start(int, char *[]);
+static void	kore_call_parent_configure(int, char **);
+
+#if !defined(KORE_SINGLE_BINARY)
+static const char	*rarg0 = NULL;
+#endif
+
+static const char	*parent_config_hook = KORE_CONFIG_HOOK;
+static const char	*parent_teardown_hook = KORE_TEARDOWN_HOOK;
+
+#if defined(KORE_SINGLE_BINARY)
+static const char	*parent_daemonized_hook = KORE_DAEMONIZED_HOOK;
+#endif
 
 static void
 usage(void)
 {
-	fprintf(stderr, "Usage: %s [options]\n", __progname);
+	if (kore_runtime_count() > 0) {
+		printf("Usage: %s [options] [app | script]\n", __progname);
+	} else {
+		printf("Usage: %s [options]\n", __progname);
+	}
 
-	fprintf(stderr, "\n");
-	fprintf(stderr, "Available options:\n");
+	printf("\n");
+	printf("Command-line options:\n");
 #if !defined(KORE_SINGLE_BINARY)
-	fprintf(stderr, "\t-c\tconfiguration to use\n");
+	printf("\t-c\tThe configuration file to load when starting.\n");
 #endif
-#if defined(KORE_DEBUG)
-	fprintf(stderr, "\t-d\trun with debug on\n");
-#endif
-	fprintf(stderr, "\t-f\tstart in foreground\n");
-	fprintf(stderr, "\t-h\tthis help text\n");
-	fprintf(stderr, "\t-n\tdo not chroot\n");
-	fprintf(stderr, "\t-q\tonly log errors\n");
-	fprintf(stderr, "\t-r\tdo not drop privileges\n");
-	fprintf(stderr, "\t-v\tdisplay %s build information\n", __progname);
+	printf("\t-f\tDo not daemonize, everything runs in the foreground.\n");
+	printf("\t-h\tThis help text.\n");
+	printf("\t-n\tDo not do the chroot privsep step.\n");
+	printf("\t-q\tQuiet mode, only logs errors.\n");
+	printf("\t-r\tDo not do the privsep user swapping step.\n");
+	printf("\t-v\tDisplay %s build information.\n", __progname);
 
-#if !defined(KORE_SINGLE_BINARY)
-	fprintf(stderr, "\nFind more information on https://kore.io\n");
-#else
-	fprintf(stderr, "\nBuilt using https://kore.io\n");
-#endif
+	printf("\n");
+	printf("Environment options:\n");
+	printf("  env KORE_MEM_GUARD=1\n");
+	printf("      Enables memory pool guards and other protections.\n");
+	printf("\n");
+	printf("      Enabling this will include guard pages for each\n");
+	printf("      pool entry allocations and mark pool entries as\n");
+	printf("      PROT_NONE when unused.\n");
+	printf("\n");
+	printf("      This catches bugs and prevents memory vulnerabilities\n");
+	printf("      but with performance and memory pressure costs.\n");
+
+	printf("\n");
 
 	exit(1);
 }
@@ -99,11 +140,11 @@ static void
 version(void)
 {
 	printf("%s ", kore_version);
-#if defined(KORE_NO_TLS)
-	printf("no-tls ");
-#endif
 #if defined(KORE_NO_HTTP)
 	printf("no-http ");
+#endif
+#if defined(KORE_USE_CURL)
+	printf("curl-%s ", LIBCURL_VERSION);
 #endif
 #if defined(KORE_USE_PGSQL)
 	printf("pgsql ");
@@ -111,15 +152,22 @@ version(void)
 #if defined(KORE_USE_TASKS)
 	printf("tasks ");
 #endif
+#if defined(KORE_USE_PYTHON)
+	printf("python-%s ", PY_VERSION);
+#endif
+#if defined(KORE_USE_LUA)
+	printf("lua-%s.%s.%s ",
+	    LUA_VERSION_MAJOR, LUA_VERSION_MINOR, LUA_VERSION_RELEASE);
+#endif
+#if defined(KORE_USE_ACME)
+	printf("acme ");
+#endif
 #if defined(KORE_DEBUG)
 	printf("debug ");
 #endif
-#if defined(KORE_SINGLE_BINARY)
-	printf("single ");
-#endif
-#if defined(KORE_USE_PYTHON)
-	printf("python ");
-#endif
+	if (!kore_tls_supported())
+		printf("notls ");
+
 	printf("\n");
 	exit(0);
 }
@@ -127,32 +175,170 @@ version(void)
 int
 main(int argc, char *argv[])
 {
+#if !defined(KORE_SINGLE_BINARY)
+	struct stat			st;
+#endif
 	struct kore_runtime_call	*rcall;
-	int				ch, flags;
 
-	flags = 0;
 	kore_argc = argc;
 	kore_argv = argv;
+
+#if !defined(KORE_SINGLE_BINARY)
+	kore_default_getopt(argc, argv);
+#endif
+
+	kore_mem_init();
+	kore_msg_init();
+	kore_log_init();
+	kore_tls_init();
+
+	kore_progname = kore_strdup(argv[0]);
+	kore_proctitle_setup();
+
+#if !defined(KORE_SINGLE_BINARY)
+	argc -= optind;
+	argv += optind;
+#endif
+
+#if !defined(KORE_SINGLE_BINARY)
+	if (kore_runtime_count() > 0) {
+		if (argc > 0) {
+			rarg0 = argv[0];
+			argc--;
+			argv++;
+		}
+
+		if (rarg0) {
+			if (lstat(rarg0, &st) == -1) {
+				if (errno == ENOENT)
+					rarg0 = NULL;
+				else
+					fatal("stat(%s): %s", rarg0, errno_s);
+			}
+		}
+	}
+#endif
+
+	kore_pid = getpid();
+	nlisteners = 0;
+	LIST_INIT(&kore_servers);
+
+	kore_platform_init();
+#if !defined(KORE_NO_HTTP)
+	http_parent_init();
+#if defined(KORE_USE_CURL)
+	kore_curl_sysinit();
+#endif
+#if defined(KORE_USE_PGSQL)
+	kore_pgsql_sys_init();
+#endif
+	kore_auth_init();
+	kore_validator_init();
+	kore_filemap_init();
+#endif
+#if defined(KORE_USE_ACME)
+	kore_acme_init();
+#endif
+	kore_domain_init();
+	kore_module_init();
+
+#if !defined(KORE_SINGLE_BINARY)
+	if (kore_runtime_count() == 0 && config_file == NULL)
+		usage();
+#endif
+	kore_module_load(NULL, NULL, KORE_MODULE_NATIVE);
+
+#if defined(KORE_USE_PYTHON)
+	kore_python_init();
+#endif
+
+#if defined(KORE_USE_LUA)
+	kore_lua_init();
+#endif
+
+#if !defined(KORE_SINGLE_BINARY)
+	if (kore_runtime_count() > 0 && rarg0 != NULL)
+		kore_runtime_resolve(rarg0, &st);
+#endif
+
+#if defined(KORE_SINGLE_BINARY)
+	kore_call_parent_configure(argc, argv);
+#else
+	if (kore_runtime_count() > 0 && rarg0 != NULL)
+		kore_call_parent_configure(argc, argv);
+#endif
+
+	kore_parse_config();
+
+#if !defined(KORE_SINGLE_BINARY)
+	free(config_file);
+#endif
+
+#if !defined(KORE_NO_HTTP)
+	if (http_body_disk_offload > 0) {
+		if (mkdir(http_body_disk_path, 0700) == -1 && errno != EEXIST) {
+			printf("can't create http_body_disk_path '%s': %s\n",
+			    http_body_disk_path, errno_s);
+			return (KORE_RESULT_ERROR);
+		}
+	}
+#endif
+
+	kore_signal_setup();
+	kore_server_start(argc, argv);
+	kore_server_shutdown();
+
+	rcall = kore_runtime_getcall(parent_teardown_hook);
+	if (rcall != NULL) {
+		kore_runtime_execute(rcall);
+		kore_free(rcall);
+	}
+
+	if (unlink(kore_pidfile) == -1 && errno != ENOENT)
+		kore_log(LOG_NOTICE, "failed to remove pidfile (%s)", errno_s);
+
+	kore_server_cleanup();
+
+	if (!kore_quiet)
+		kore_log(LOG_INFO, "goodbye");
+
+#if defined(KORE_USE_PYTHON)
+	kore_python_cleanup();
+#endif
+
+#if defined(KORE_USE_LUA)
+	kore_lua_cleanup();
+#endif
+
+	kore_mem_cleanup();
+
+	return (kore_quit);
+}
+
+void
+kore_default_getopt(int argc, char **argv)
+{
+	int		ch;
 
 #if !defined(KORE_SINGLE_BINARY)
 	while ((ch = getopt(argc, argv, "c:dfhnqrv")) != -1) {
 #else
 	while ((ch = getopt(argc, argv, "dfhnqrv")) != -1) {
 #endif
-		flags++;
 		switch (ch) {
 #if !defined(KORE_SINGLE_BINARY)
 		case 'c':
-			config_file = optarg;
+			free(config_file);
+			if ((config_file = strdup(optarg)) == NULL)
+				fatal("strdup");
 			break;
 #endif
-#if defined(KORE_DEBUG)
 		case 'd':
-			kore_debug = 1;
+			kore_foreground = 0;
 			break;
-#endif
 		case 'f':
-			foreground = 1;
+			printf("note: -f is the default now, "
+			    "use -d to daemonize\n");
 			break;
 		case 'h':
 			usage();
@@ -173,155 +359,15 @@ main(int argc, char *argv[])
 			usage();
 		}
 	}
-
-	kore_mem_init();
-	kore_progname = kore_strdup(argv[0]);
-
-	argc -= optind;
-	argv += optind;
-
-#if !defined(KORE_SINGLE_BINARY)
-	if (argc > 0)
-		fatal("did you mean to run `kodev' instead?");
-#endif
-
-	kore_pid = getpid();
-	nlisteners = 0;
-	LIST_INIT(&listeners);
-
-	kore_log_init();
-#if !defined(KORE_NO_HTTP)
-	http_parent_init();
-	kore_auth_init();
-	kore_validator_init();
-	kore_filemap_init();
-#endif
-	kore_domain_init();
-	kore_module_init();
-	kore_server_sslstart();
-
-#if !defined(KORE_SINGLE_BINARY)
-	if (config_file == NULL)
-		usage();
-#endif
-	kore_module_load(NULL, NULL, KORE_MODULE_NATIVE);
-
-#if defined(KORE_USE_PYTHON)
-	kore_python_init();
-#endif
-
-	kore_parse_config();
-
-#if defined(KORE_SINGLE_BINARY)
-	rcall = kore_runtime_getcall("kore_parent_configure");
-	if (rcall != NULL) {
-		kore_runtime_configure(rcall, argc, argv);
-		kore_free(rcall);
-	}
-#endif
-
-	kore_platform_init();
-
-#if !defined(KORE_NO_HTTP)
-	if (http_body_disk_offload > 0) {
-		if (mkdir(http_body_disk_path, 0700) == -1 && errno != EEXIST) {
-			printf("can't create http_body_disk_path '%s': %s\n",
-			    http_body_disk_path, errno_s);
-			return (KORE_RESULT_ERROR);
-		}
-	}
-#endif
-
-	kore_signal_setup();
-	kore_server_start(argc, argv);
-
-	if (!kore_quiet)
-		kore_log(LOG_NOTICE, "server shutting down");
-
-	kore_worker_shutdown();
-
-	rcall = kore_runtime_getcall("kore_parent_teardown");
-	if (rcall != NULL) {
-		kore_runtime_execute(rcall);
-		kore_free(rcall);
-	}
-
-	if (unlink(kore_pidfile) == -1 && errno != ENOENT)
-		kore_log(LOG_NOTICE, "failed to remove pidfile (%s)", errno_s);
-
-	kore_listener_cleanup();
-
-	if (!kore_quiet)
-		kore_log(LOG_NOTICE, "goodbye");
-
-#if defined(KORE_USE_PYTHON)
-	kore_python_cleanup();
-#endif
-
-	kore_mem_cleanup();
-
-	return (0);
 }
-
-#if !defined(KORE_NO_TLS)
-int
-kore_tls_sni_cb(SSL *ssl, int *ad, void *arg)
-{
-	struct kore_domain	*dom;
-	const char		*sname;
-
-	sname = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
-	kore_debug("kore_tls_sni_cb(): received host %s", sname);
-
-	if (sname != NULL && (dom = kore_domain_lookup(sname)) != NULL) {
-		if (dom->ssl_ctx == NULL) {
-			kore_log(LOG_NOTICE,
-			    "TLS configuration for %s not complete",
-			    dom->domain);
-			return (SSL_TLSEXT_ERR_NOACK);
-		}
-
-		kore_debug("kore_ssl_sni_cb(): Using %s CTX", sname);
-		SSL_set_SSL_CTX(ssl, dom->ssl_ctx);
-
-		if (dom->cafile != NULL) {
-			SSL_set_verify(ssl, SSL_VERIFY_PEER |
-			    SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
-		} else {
-			SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
-		}
-
-		return (SSL_TLSEXT_ERR_OK);
-	}
-
-	return (SSL_TLSEXT_ERR_NOACK);
-}
-
-void
-kore_tls_info_callback(const SSL *ssl, int flags, int ret)
-{
-	struct connection	*c;
-
-	if (flags & SSL_CB_HANDSHAKE_START) {
-		if ((c = SSL_get_app_data(ssl)) == NULL)
-			fatal("no SSL_get_app_data");
-
-#if defined(TLS1_3_VERSION)
-		if (SSL_version(ssl) != TLS1_3_VERSION)
-#endif
-			c->tls_reneg++;
-	}
-}
-#endif
 
 int
-kore_server_bind(const char *ip, const char *port, const char *ccb)
+kore_server_bind(struct kore_server *srv, const char *ip, const char *port,
+    const char *ccb)
 {
 	int			r;
 	struct listener		*l;
 	struct addrinfo		hints, *results;
-
-	kore_debug("kore_server_bind(%s, %s)", ip, port);
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
@@ -333,7 +379,11 @@ kore_server_bind(const char *ip, const char *port, const char *ccb)
 	if (r != 0)
 		fatal("getaddrinfo(%s): %s", ip, gai_strerror(r));
 
-	if ((l = kore_listener_alloc(results->ai_family, ccb)) == NULL) {
+	l = kore_listener_create(srv);
+	l->host = kore_strdup(ip);
+	l->port = kore_strdup(port);
+
+	if (!kore_listener_init(l, results->ai_family, ccb)) {
 		freeaddrinfo(results);
 		return (KORE_RESULT_ERROR);
 	}
@@ -353,19 +403,12 @@ kore_server_bind(const char *ip, const char *port, const char *ccb)
 		return (KORE_RESULT_ERROR);
 	}
 
-	if (foreground && !kore_quiet) {
-#if !defined(KORE_NO_TLS)
-		kore_log(LOG_NOTICE, "running on https://%s:%s", ip, port);
-#else
-		kore_log(LOG_NOTICE, "running on http://%s:%s", ip, port);
-#endif
-	}
-
 	return (KORE_RESULT_OK);
 }
 
 int
-kore_server_bind_unix(const char *path, const char *ccb)
+kore_server_bind_unix(struct kore_server *srv, const char *path,
+    const char *ccb)
 {
 	struct listener		*l;
 	int			len;
@@ -384,12 +427,25 @@ kore_server_bind_unix(const char *path, const char *ccb)
 #if defined(__linux__)
 	if (sun.sun_path[0] == '@')
 		sun.sun_path[0] = '\0';
+	socklen = sizeof(sun.sun_family) + len;
+#else
+	socklen = sizeof(sun);
 #endif
 
-	socklen = sizeof(sun.sun_family) + len;
+	l = kore_listener_create(srv);
+	l->host = kore_strdup(path);
 
-	if ((l = kore_listener_alloc(AF_UNIX, ccb)) == NULL)
+	if (!kore_listener_init(l, AF_UNIX, ccb))
 		return (KORE_RESULT_ERROR);
+
+	if (sun.sun_path[0] != '\0') {
+		if (unlink(sun.sun_path) == -1 && errno != ENOENT) {
+			kore_log(LOG_ERR, "unlink: %s: %s",
+			    sun.sun_path, errno_s);
+			kore_listener_free(l);
+			return (KORE_RESULT_ERROR);
+		}
+	}
 
 	if (bind(l->fd, (struct sockaddr *)&sun, socklen) == -1) {
 		kore_log(LOG_ERR, "bind: %s", errno_s);
@@ -403,17 +459,90 @@ kore_server_bind_unix(const char *path, const char *ccb)
 		return (KORE_RESULT_ERROR);
 	}
 
-	if (foreground && !kore_quiet)
-		kore_log(LOG_NOTICE, "running on %s", path);
-
 	return (KORE_RESULT_OK);
 }
 
+struct kore_server *
+kore_server_create(const char *name)
+{
+	struct kore_server	*srv;
+
+	srv = kore_calloc(1, sizeof(struct kore_server));
+	srv->name = kore_strdup(name);
+
+	if (kore_tls_supported())
+		srv->tls = 1;
+	else
+		srv->tls = 0;
+
+	TAILQ_INIT(&srv->domains);
+	LIST_INIT(&srv->listeners);
+
+	LIST_INSERT_HEAD(&kore_servers, srv, list);
+
+	return (srv);
+}
+
+void
+kore_server_finalize(struct kore_server *srv)
+{
+	struct listener		*l;
+	const char		*proto;
+
+	if (kore_quiet)
+		return;
+
+	LIST_FOREACH(l, &srv->listeners, list) {
+		if (srv->tls)
+			proto = "https";
+		else
+			proto = "http";
+
+		if (l->family == AF_UNIX) {
+			kore_log(LOG_INFO, "%s serving %s on %s",
+			    srv->name, proto, l->host);
+		} else {
+			kore_log(LOG_INFO, "%s serving %s on %s:%s",
+			    srv->name, proto, l->host, l->port);
+		}
+	}
+}
+
 struct listener *
-kore_listener_alloc(int family, const char *ccb)
+kore_listener_create(struct kore_server *server)
 {
 	struct listener		*l;
 
+	l = kore_calloc(1, sizeof(struct listener));
+
+	nlisteners++;
+	LIST_INSERT_HEAD(&server->listeners, l, list);
+
+	l->server = server;
+
+	l->fd = -1;
+	l->evt.type = KORE_TYPE_LISTENER;
+	l->evt.handle = kore_listener_accept;
+
+	return (l);
+}
+
+struct kore_server *
+kore_server_lookup(const char *name)
+{
+	struct kore_server	*srv;
+
+	LIST_FOREACH(srv, &kore_servers, list) {
+		if (!strcmp(srv->name, name))
+			return (srv);
+	}
+
+	return (NULL);
+}
+
+int
+kore_listener_init(struct listener *l, int family, const char *ccb)
+{
 	switch (family) {
 	case AF_INET:
 	case AF_INET6:
@@ -423,60 +552,91 @@ kore_listener_alloc(int family, const char *ccb)
 		fatal("unknown address family %d", family);
 	}
 
-	l = kore_calloc(1, sizeof(struct listener));
-
-	nlisteners++;
-	LIST_INSERT_HEAD(&listeners, l, list);
-
-	l->fd = -1;
 	l->family = family;
-
-	l->evt.type = KORE_TYPE_LISTENER;
-	l->evt.handle = kore_listener_accept;
 
 	if ((l->fd = socket(family, SOCK_STREAM, 0)) == -1) {
 		kore_listener_free(l);
 		kore_log(LOG_ERR, "socket(): %s", errno_s);
-		return (NULL);
+		return (KORE_RESULT_ERROR);
 	}
 
 	if (fcntl(l->fd, F_SETFD, FD_CLOEXEC) == -1) {
 		kore_listener_free(l);
 		kore_log(LOG_ERR, "fcntl(): %s", errno_s);
-		return (NULL);
+		return (KORE_RESULT_ERROR);
 	}
 
 	if (!kore_connection_nonblock(l->fd, family != AF_UNIX)) {
 		kore_listener_free(l);
 		kore_log(LOG_ERR, "kore_connection_nonblock(): %s", errno_s);
-		return (NULL);
+		return (KORE_RESULT_ERROR);
 	}
 
 	if (!kore_sockopt(l->fd, SOL_SOCKET, SO_REUSEADDR)) {
 		kore_listener_free(l);
-		return (NULL);
+		return (KORE_RESULT_ERROR);
 	}
 
 	if (ccb != NULL) {
 		if ((l->connect = kore_runtime_getcall(ccb)) == NULL) {
 			kore_log(LOG_ERR, "no such callback: '%s'", ccb);
 			kore_listener_free(l);
-			return (NULL);
+			return (KORE_RESULT_ERROR);
 		}
 	} else {
 		l->connect = NULL;
 	}
 
-	return (l);
+	return (KORE_RESULT_OK);
+}
+
+void
+kore_server_free(struct kore_server *srv)
+{
+	struct listener		*l;
+	struct kore_domain	*dom;
+
+	LIST_REMOVE(srv, list);
+
+	while ((dom = TAILQ_FIRST(&srv->domains)) != NULL)
+		kore_domain_free(dom);
+
+	while ((l = LIST_FIRST(&srv->listeners)) != NULL)
+		kore_listener_free(l);
+
+	kore_free(srv->name);
+	kore_free(srv);
 }
 
 void
 kore_listener_free(struct listener *l)
 {
+	int	rm;
+
 	LIST_REMOVE(l, list);
 
 	if (l->fd != -1)
 		close(l->fd);
+
+	rm = 0;
+
+#if defined(__linux__)
+	if (worker == NULL && l->family == AF_UNIX && l->host[0] != '@')
+		rm++;
+#else
+	if (worker == NULL && l->family == AF_UNIX)
+		rm++;
+#endif
+	if (rm) {
+		if (unlink(l->host) == -1) {
+			kore_log(LOG_NOTICE,
+			    "failed to remove unix socket %s (%s)", l->host,
+			    errno_s);
+		}
+	}
+
+	kore_free(l->host);
+	kore_free(l->port);
 
 	kore_free(l);
 }
@@ -531,6 +691,23 @@ kore_sockopt(int fd, int what, int opt)
 void
 kore_signal_setup(void)
 {
+	kore_signal_trap(SIGHUP);
+	kore_signal_trap(SIGQUIT);
+	kore_signal_trap(SIGTERM);
+	kore_signal_trap(SIGUSR1);
+	kore_signal_trap(SIGCHLD);
+
+	if (kore_foreground)
+		kore_signal_trap(SIGINT);
+	else
+		(void)signal(SIGINT, SIG_IGN);
+
+	(void)signal(SIGPIPE, SIG_IGN);
+}
+
+void
+kore_signal_trap(int sig)
+{
 	struct sigaction	sa;
 
 	sig_recv = 0;
@@ -540,36 +717,29 @@ kore_signal_setup(void)
 	if (sigfillset(&sa.sa_mask) == -1)
 		fatal("sigfillset: %s", errno_s);
 
-	if (sigaction(SIGHUP, &sa, NULL) == -1)
+	if (sigaction(sig, &sa, NULL) == -1)
 		fatal("sigaction: %s", errno_s);
-	if (sigaction(SIGQUIT, &sa, NULL) == -1)
-		fatal("sigaction: %s", errno_s);
-	if (sigaction(SIGTERM, &sa, NULL) == -1)
-		fatal("sigaction: %s", errno_s);
-	if (sigaction(SIGUSR1, &sa, NULL) == -1)
-		fatal("sigaction: %s", errno_s);
-	if (sigaction(SIGCHLD, &sa, NULL) == -1)
-		fatal("sigaction: %s", errno_s);
-
-	if (foreground) {
-		if (sigaction(SIGINT, &sa, NULL) == -1)
-			fatal("sigaction: %s", errno_s);
-	} else {
-		(void)signal(SIGINT, SIG_IGN);
-	}
-
-	(void)signal(SIGPIPE, SIG_IGN);
 }
 
 void
-kore_listener_cleanup(void)
+kore_server_closeall(void)
 {
 	struct listener		*l;
+	struct kore_server	*srv;
 
-	while (!LIST_EMPTY(&listeners)) {
-		l = LIST_FIRST(&listeners);
-		kore_listener_free(l);
+	LIST_FOREACH(srv, &kore_servers, list) {
+		LIST_FOREACH(l, &srv->listeners, list)
+			l->fd = -1;
 	}
+}
+
+void
+kore_server_cleanup(void)
+{
+	struct kore_server	*srv;
+
+	while ((srv = LIST_FIRST(&kore_servers)) != NULL)
+		kore_server_free(srv);
 }
 
 void
@@ -592,55 +762,103 @@ kore_shutdown(void)
 void
 kore_proctitle(const char *title)
 {
-	char		*p;
-	size_t		len;
-	int		i, slen;
+	int	len;
 
-	len = 0;
+	kore_argv[1] = NULL;
+
+	len = snprintf(kore_argv[0], proctitle_maxlen, "%s %s",
+	    basename(kore_progname), title);
+	if (len == -1 || (size_t)len >= proctitle_maxlen)
+		fatal("proctitle '%s' too large", title);
+
+	memset(kore_argv[0] + len, 0, proctitle_maxlen - len);
+}
+
+void
+kore_hooks_set(const char *config, const char *teardown, const char *daemonized)
+{
+	parent_config_hook = config;
+	parent_teardown_hook = teardown;
+
+#if defined(KORE_SINGLE_BINARY)
+	parent_daemonized_hook = daemonized;
+#endif
+}
+
+static void
+kore_proctitle_setup(void)
+{
+	int		i;
+	char		*p;
+
+	proctitle_maxlen = 0;
 
 	for (i = 0; environ[i] != NULL; i++) {
-		p = kore_strdup(environ[i]);
-		len += strlen(environ[i]) + 1;
+		if ((p = strdup(environ[i])) == NULL)
+			fatal("strdup");
+		proctitle_maxlen += strlen(environ[i]) + 1;
 		environ[i] = p;
 	}
 
 	for (i = 0; kore_argv[i] != NULL; i++)
-		len += strlen(kore_argv[i]) + 1;
-
-	kore_argv[1] = NULL;
-
-	slen = snprintf(kore_argv[0], len, "%s %s",
-	    basename(kore_progname), title);
-	if (slen == -1 || (size_t)slen >= len)
-		fatal("proctitle '%s' too large", title);
-
-	memset(kore_argv[0] + slen, 0, len - slen);
-}
-
-static void
-kore_server_sslstart(void)
-{
-#if !defined(KORE_NO_TLS)
-	kore_debug("kore_server_sslstart()");
-
-	SSL_library_init();
-	SSL_load_error_strings();
-#endif
+		proctitle_maxlen += strlen(kore_argv[i]) + 1;
 }
 
 static void
 kore_server_start(int argc, char *argv[])
 {
 	u_int32_t			tmp;
-	struct kore_runtime_call	*rcall;
+	struct kore_server		*srv;
 	u_int64_t			netwait;
-	int				quit, last_sig;
+	int				last_sig;
+#if !defined(KORE_NO_HTTP)
+	int				alog;
+	struct kore_domain		*dom;
+#endif
+#if defined(KORE_SINGLE_BINARY)
+	struct kore_runtime_call	*rcall;
+#endif
 
-	if (foreground == 0) {
+	if (!kore_quiet) {
+		kore_log(LOG_INFO, "%s %s starting, built=%s",
+		    __progname, kore_version, kore_build_date);
+		kore_log(LOG_INFO, "memory pool protections: %s",
+		    kore_mem_guard ? "enabled" : "disabled");
+		kore_log(LOG_INFO, "built-ins: "
+#if defined(__linux__)
+		    "seccomp "
+#endif
+#if defined(KORE_USE_PGSQL)
+		    "pgsql "
+#endif
+#if defined(KORE_USE_TASKS)
+		    "tasks "
+#endif
+#if defined(KORE_USE_JSONRPC)
+		    "jsonrpc "
+#endif
+#if defined(KORE_USE_PYTHON)
+		    "python "
+#endif
+#if defined(KORE_USE_ACME)
+		    "acme "
+#endif
+#if defined(KORE_USE_CURL)
+		    "curl "
+#endif
+#if defined(KORE_USE_LUA)
+		    "lua "
+#endif
+		);
+	}
+
+	kore_tls_log_version();
+
+	if (kore_foreground == 0) {
 		if (daemon(1, 0) == -1)
 			fatal("cannot daemon(): %s", errno_s);
 #if defined(KORE_SINGLE_BINARY)
-		rcall = kore_runtime_getcall("kore_parent_daemonized");
+		rcall = kore_runtime_getcall(parent_daemonized_hook);
 		if (rcall != NULL) {
 			kore_runtime_execute(rcall);
 			kore_free(rcall);
@@ -651,33 +869,41 @@ kore_server_start(int argc, char *argv[])
 	kore_pid = getpid();
 	kore_write_kore_pid();
 
-	if (!kore_quiet) {
-		kore_log(LOG_NOTICE, "%s is starting up", __progname);
-#if defined(KORE_USE_PGSQL)
-		kore_log(LOG_NOTICE, "pgsql built-in enabled");
-#endif
-#if defined(KORE_USE_TASKS)
-		kore_log(LOG_NOTICE, "tasks built-in enabled");
-#endif
-#if defined(KORE_USE_JSONRPC)
-		kore_log(LOG_NOTICE, "jsonrpc built-in enabled");
-#endif
-#if defined(KORE_USE_PYTHON)
-		kore_log(LOG_NOTICE, "python built-in enabled");
-#endif
-	}
-
 #if !defined(KORE_SINGLE_BINARY)
-	rcall = kore_runtime_getcall("kore_parent_configure");
-	if (rcall != NULL) {
-		kore_runtime_configure(rcall, argc, argv);
-		kore_free(rcall);
-	}
+	if (kore_runtime_count() == 0 || rarg0 == NULL)
+		kore_call_parent_configure(argc, argv);
 #endif
+
+#if defined(KORE_USE_PYTHON)
+	kore_python_routes_resolve();
+#endif
+
+	/* Check if keymgr will be active. */
+	if (kore_tls_supported()) {
+		LIST_FOREACH(srv, &kore_servers, list) {
+			if (srv->tls) {
+				kore_keymgr_active = 1;
+				break;
+			}
+		}
+	} else {
+		kore_keymgr_active = 0;
+	}
 
 	kore_platform_proctitle("[parent]");
-	kore_msg_init();
-	kore_worker_init();
+
+	if (!kore_worker_init()) {
+		kore_log(LOG_ERR, "last worker log lines:");
+		kore_log(LOG_ERR, "=====================================");
+		net_init();
+		kore_connection_init();
+		kore_platform_event_init();
+		kore_msg_parent_init();
+		kore_platform_event_wait(10);
+		kore_worker_dispatch_signal(SIGQUIT);
+		kore_log(LOG_ERR, "=====================================");
+		return;
+	}
 
 	/* Set worker_max_connections for kore_connection_init(). */
 	tmp = worker_max_connections;
@@ -688,31 +914,47 @@ kore_server_start(int argc, char *argv[])
 	kore_platform_event_init();
 	kore_msg_parent_init();
 
-	quit = 0;
 	worker_max_connections = tmp;
 
 	kore_timer_init();
+
 #if !defined(KORE_NO_HTTP)
-	kore_timer_add(kore_accesslog_run, 100, NULL, 0);
+	alog = 0;
+
+	LIST_FOREACH(srv, &kore_servers, list) {
+		TAILQ_FOREACH(dom, &srv->domains, list) {
+			if (dom->accesslog != -1)
+				alog = 1;
+		}
+	}
+
+	if (alog) {
+		kore_timer_add(kore_accesslog_run, 100, NULL, 0);
+		kore_log(LOG_INFO, "accesslog vacuum is enabled");
+	}
 #endif
 
-	while (quit != 1) {
-		if (sig_recv != 0) {
-			last_sig = sig_recv;
+#if defined(KORE_USE_PYTHON)
+	kore_msg_unregister(KORE_PYTHON_SEND_OBJ);
+#endif
 
-			switch (sig_recv) {
+	while (kore_quit == KORE_QUIT_NONE) {
+		last_sig = sig_recv;
+
+		if (last_sig != 0) {
+			switch (last_sig) {
 			case SIGHUP:
-				kore_worker_dispatch_signal(sig_recv);
+				kore_worker_dispatch_signal(last_sig);
 				kore_module_reload(0);
 				break;
 			case SIGINT:
 			case SIGQUIT:
 			case SIGTERM:
-				quit = 1;
-				kore_worker_dispatch_signal(sig_recv);
+				kore_quit = KORE_QUIT_NORMAL;
+				kore_worker_dispatch_signal(last_sig);
 				continue;
 			case SIGUSR1:
-				kore_worker_dispatch_signal(sig_recv);
+				kore_worker_dispatch_signal(last_sig);
 				break;
 			case SIGCHLD:
 				kore_worker_reap();
@@ -731,7 +973,19 @@ kore_server_start(int argc, char *argv[])
 		kore_platform_event_wait(netwait);
 		kore_connection_prune(KORE_CONNECTION_PRUNE_DISCONNECT);
 		kore_timer_run(kore_time_ms());
+		kore_worker_reap();
 	}
+
+	kore_worker_dispatch_signal(SIGQUIT);
+}
+
+static void
+kore_server_shutdown(void)
+{
+	if (!kore_quiet)
+		kore_log(LOG_INFO, "server shutting down");
+
+	kore_worker_shutdown();
 
 #if !defined(KORE_NO_HTTP)
 	kore_accesslog_gather(NULL, kore_time_ms(), 1);
@@ -740,6 +994,7 @@ kore_server_start(int argc, char *argv[])
 	kore_platform_event_cleanup();
 	kore_connection_cleanup();
 	kore_domain_cleanup();
+	kore_tls_cleanup();
 	net_cleanup();
 }
 
@@ -754,5 +1009,17 @@ kore_write_kore_pid(void)
 	} else {
 		fprintf(fp, "%d\n", kore_pid);
 		fclose(fp);
+	}
+}
+
+static void
+kore_call_parent_configure(int argc, char **argv)
+{
+	struct kore_runtime_call	*rcall;
+
+	rcall = kore_runtime_getcall(parent_config_hook);
+	if (rcall != NULL) {
+		kore_runtime_configure(rcall, argc, argv);
+		kore_free(rcall);
 	}
 }

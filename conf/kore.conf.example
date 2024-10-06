@@ -10,19 +10,76 @@
 #socket_backlog			5000
 
 # Server configuration.
-bind		127.0.0.1 443
-#bind_unix	/var/run/kore.sock
+server tls {
+	bind		127.0.0.1 443
+	#unix		/var/run/kore.sock
+}
 
-# The worker process root directory. If chrooting was not disabled
-# at startup the worker processes will chroot into this directory.
+#server notls {
+#	bind		127.0.0.1 80
+#	tls		no
+#}
+
+# Kore can have multiple settings for each processes that run under it.
+# There are 3 different type of processes:
 #
-# If this configuration option is not set, Kore will take the current
-# working directory as the root.
-root		/home/joris/src/kore
+#	1) A worker process, these handle the HTTP requests and your code
+#	   runs inside of these.
+#	2) A keymgr process, this handles your domain private keys
+#	   and signing during the TLS handshakes. It also holds your
+#	   ACME account-key and will sign ACME requests.
+#	3) An acme process, this talks to the ACME servers.
+#
+# You can individually turn on/off chrooting and dropping user
+# privileges per process. The -n and -r command-line options
+# are a global override for skipping chroot or dropping user
+# permissions on all processes.
+#
+# If no root/runas options are set in a process, it will inherit the
+# default values from the worker processes.
+#
+# The worker processes will get the current working directory or
+# current user if no options where specified for it.
+#
+# Configures the worker processes.
+privsep worker {
+	# The user the workers will run as.
+	runas		kore
 
-# Worker processes will run as the specified user. If this option is
-# missing Kore will run as the current user.
-runas		joris
+	# The root directory for the worker processes, if chroot isn't
+	# skipped, this is the directory it will chroot into.
+	#
+	# If not set, Kore will take the current working directory.
+	root		/var/chroot/kore
+
+	# We could configure this process to not chroot and only
+	# chdir into its root directory.
+	#skip		chroot
+}
+
+# Configures the keymgr process.
+#	If TLS is enabled you will need to specify paths to the domain
+#	certificate and key that Kore will load. This loading is done
+#	from the keymgr (separate process) and all paths must be relative
+#	to the keymgr process its root configuration option.
+privsep keymgr {
+	# The user the keymgr will run as.
+	runas		keymgr
+
+	# The root directory for the keymgr process. In this example
+	# we do not turn off chroot for this process so the keymgr
+	# will chroot into this directory.
+	root		/etc/keymgr
+}
+
+# Configure Kore to log all worker output to a certain file.
+#
+# This forces all logs from the workers to be written to this file
+# instead of stdout. Note that this is not the actual access log.
+#
+# Any message logged by your application with kore_log() will also
+# appear under here.
+#logfile /var/log/kore.log
 
 # How many worker processes Kore will spawn. If the directive
 # worker_set_affinity is set to 1 (the default) Kore will automatically
@@ -54,7 +111,7 @@ workers		4
 #worker_accept_threshold		16
 
 # What should the Kore parent process do if a worker
-# process unexpectly exits. The default policy is that
+# process unexpectedly exits. The default policy is that
 # the worker process is automatically restarted.
 #
 # If you want the kore server to exit if a worker dies
@@ -80,25 +137,6 @@ workers		4
 #
 # NOTE: This file location must be inside your chrooted environment.
 #rand_file	random.data
-
-# Key manager specific options.
-#	If TLS is enabled you will need to specify paths to the domain
-#	certificate and key that Kore will load. This loading is done
-#	from the keymgr (separate process) and all paths must be relative
-#	to the keymgr_root configuration option.
-#
-#	keymgr_root	The root path the keymgr will chdir into.
-#				If chroot was not disable at startup time
-#				the keymgr process will chroot into here.
-#
-#	keymgr_runas	The user to run the keymgr as.
-#
-#	If privsep and chrooting is enabled at startup time but these
-#	configuration options were not set, they will take over the
-#	values from the 'root' and 'runas' configuration options.
-#
-#keymgr_root
-#keymgr_runas
 
 # Filemap settings
 #	filemap_index	Name of the file to be used as the directory
@@ -142,6 +180,8 @@ workers		4
 #	http_request_ms		The number of milliseconds workers can max
 #				spend inside the HTTP processing loop.
 #
+#	http_server_version	Override the server version string.
+#
 #http_header_max	4096
 #http_header_timeout	10
 #http_body_max		1024000
@@ -152,6 +192,7 @@ workers		4
 #http_request_ms	10
 #http_body_disk_offload	0
 #http_body_disk_path	tmp_files
+#http_server_version	kore
 
 # Websocket specific settings.
 #	websocket_maxframe	Specifies the maximum frame size we can receive
@@ -179,18 +220,32 @@ validator	v_regex		regex		^/test/[a-z]*$
 validator	v_number	regex		^[0-9]*$
 validator	v_session	function	v_session_validate
 
-# Specify what TLS version to be used. Default is TLSv1.2
+# Specify what TLS version to be used. Default is TLSv1.3 if available.
+# Otherwise it will use TLS 1.2.
 # Allowed values:
-#	1.2 for TLSv1.2 (default)
-#	1.0 for TLSv1.0
-#	both for TLSv1.0 and TLSv1.2
-#tls_version	1.2
+#	1.3 for TLSv1.3 (default, if available)
+#	1.2 for TLSv1.2
+#	both for TLSv1.2 and TLSv1.3
+#tls_version	1.3
 
 # Specify the TLS ciphers that will be used.
-#tls_cipher	ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384:kEDH+AESGCM:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:DHE-RSA-AES128-SHA256:DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-DSS-AES256-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:HIGH:!aNULL:!eNULL:!EXPORT:!DES:!3DES:!MD5:!PSK:!kRSA:!kDSA
+#tls_cipher	AEAD-AES256-GCM-SHA384:AEAD-CHACHA20-POLY1305-SHA256:AEAD-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-AES128-GCM-SHA256
 
-# Required DH parameters for TLS.
-#tls_dhparam	dh2048.pem
+# Required DH parameters for TLS if DHE ciphersuites are in-use.
+# Defaults to SHARE_DIR/ffdhe4096.pem, can be overwritten.
+#tls_dhparam	/usr/local/share/kore/ffdhe4096.pem
+
+# OpenBSD specific settings.
+# Add more pledges if your application requires more privileges.
+# All worker processes call pledge(2) after dropping privileges
+# (even if -rn was specified).
+# By default Kore will use the following promises: "stdio rpath inet error"
+#pledge dns wpath
+
+# seccomp specific settings.
+# If set to "yes", Kore will trace its child processes and properly
+# log seccomp violations while still allowing the syscalls.
+#seccomp_tracing	yes
 
 # Authentication configuration
 #
@@ -255,86 +310,58 @@ authentication auth_example {
 #		- Configure the depth for x509 chain validation.
 #		  By default 1.
 #
-# Handlers
+# Routes
 #
-# Handlers are either static (for fixed paths) or dynamic.
-# Dynamic handlers take a POSIX regular expression as its path.
+# Routes can be a static path or a POSIX regular expression.
 #
-# Syntax:
-#	handler		path		module_callback		[auth block]
+# route /path {
+#	handler myhandler
+#	methods get post
+#	...
+# }
 #
-# Note that the auth block is optional and if set will force Kore to
-# authenticate the user according to the authentication block its settings
-# before allowing access to the page.
 
 # Example domain that responds to localhost.
 domain localhost {
+	attach		tls
+
 	certfile	cert/server.crt
 	certkey		cert/server.key
 	accesslog	/var/log/kore_access.log
 
-	# Page handlers with no authentication required.
-	static		/css/style.css		serve_style_css
-	static		/			serve_index
-	static		/intro.jpg		serve_intro
-	static		/b64test		serve_b64test
-	static		/upload			serve_file_upload
-	static		/lock-test		serve_lock_test
-	static		/validator		serve_validator
-	static		/params-test		serve_params_test
-	static		/private		serve_private
+	route / {
+		handler index_page
+		methods get
+	}
 
-	# Restrict some URIs to certain methods
-	restrict /private post
-	restrict /validator post get head
+	route /login {
+		handler login_do
+		methods post
+		validate post username v_username
+		validate post passphrase v_passphrase
+	}
 
-	# Page handlers with authentication.
-	static		/private/test	serve_private_test	auth_example
+	route /mypages/ {
+		handler mypages_index
+		methods get
+		authenticate auth_example
+	}
 
-	# Allow access to files from the directory static_files via
+	# Allow access to files from the directory route_files via
 	# the /files/ URI.
 	#
 	# Note the directory given must be relative to the root configuration
 	# option.
-	filemap		/files/			static_files
-
-	# Configure /params-test POST to only accept the following parameters.
-	# They are automatically tested against the validator listed.
-	# If the validator would fail Kore will automatically remove the
-	# failing parameter, indicating something was wrong with it.
-	# Any parameters not present in the params block are also filtered out.
-	params post /params-test {
-		validate	test1		v_example
-		validate	test2		v_regex
-	}
-
-	# Configure a GET parameter that /params-test can received. As before
-	# this is validated against the validator and removed if validation
-	# fails. All extra parameters in the GET query are filtered out.
-	params get /params-test {
-		validate	arg1		v_example
-		validate	id		v_number
-	}
-
-	# Configure a params block for allowed parameters in the
-	# querystring when performing a POST against /params-test.
-	# You do this by prefixing the method with the qs: marker.
-	# In the param blocks below we allow the parameter "post_id"
-	# in the querystring validated by v_number when a POST is
-	# done against the supplied URL.
-	params qs:post /params-test {
-		validate	post_id		v_number
-	}
+	filemap		/files/			static_files	[auth]
 }
 
-#domain domain.com {
-#	certfile		cert/other/server.crt
-#	certkey			cert/other/server.key
-#	accesslog		/var/log/other_kore_access.log
-#	client_verify		/other/ca.crt
-#	client_verify_depth	1
-
-#	static		/css/style.css		serve_style_css
-#	static		/			serve_index
-#	dynamic		^/[a-z0-9_]*$		serve_profile
+# Example redirect 80->443.
+#domain localhost {
+#	attach		notls
+#
+#	# specific redirect with a capture group and arguments
+#	redirect	^/account/(.*)$	301	https://localhost/account/$1
+#
+#	# redirect the others back to root.
+#	redirect	^/.*$		301	https://localhost
 #}

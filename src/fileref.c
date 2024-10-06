@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2019-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -43,13 +43,14 @@ kore_fileref_init(void)
 }
 
 struct kore_fileref *
-kore_fileref_create(const char *path, int fd, off_t size, struct timespec *ts)
+kore_fileref_create(struct kore_server *srv, const char *path, int fd,
+    off_t size, struct timespec *ts)
 {
 	struct kore_fileref	*ref;
 
 	fileref_timer_prime();
 
-	if ((ref = kore_fileref_get(path)) != NULL)
+	if ((ref = kore_fileref_get(path, srv->tls)) != NULL)
 		return (ref);
 
 	ref = kore_pool_get(&ref_pool);
@@ -57,6 +58,7 @@ kore_fileref_create(const char *path, int fd, off_t size, struct timespec *ts)
 	ref->cnt = 1;
 	ref->flags = 0;
 	ref->size = size;
+	ref->ontls = srv->tls;
 	ref->path = kore_strdup(path);
 	ref->mtime_sec = ts->tv_sec;
 	ref->mtime = ((u_int64_t)(ts->tv_sec * 1000 + (ts->tv_nsec / 1000000)));
@@ -74,7 +76,22 @@ kore_fileref_create(const char *path, int fd, off_t size, struct timespec *ts)
 		fatal("net_send_file: madvise: %s", errno_s);
 	close(fd);
 #else
-	ref->fd = fd;
+	if (srv->tls == 0) {
+		ref->fd = fd;
+	} else {
+		if ((uintmax_t)size > SIZE_MAX) {
+			kore_pool_put(&ref_pool, ref);
+			return (NULL);
+		}
+
+		ref->base = mmap(NULL,
+		    (size_t)size, PROT_READ, MAP_PRIVATE, fd, 0);
+		if (ref->base == MAP_FAILED)
+			fatal("net_send_file: mmap failed: %s", errno_s);
+		if (madvise(ref->base, (size_t)size, MADV_SEQUENTIAL) == -1)
+			fatal("net_send_file: madvise: %s", errno_s);
+		close(fd);
+	}
 #endif
 
 #if defined(FILEREF_DEBUG)
@@ -91,14 +108,14 @@ kore_fileref_create(const char *path, int fd, off_t size, struct timespec *ts)
  * if they don't end up using the ref.
  */
 struct kore_fileref *
-kore_fileref_get(const char *path)
+kore_fileref_get(const char *path, int ontls)
 {
 	struct stat		st;
 	struct kore_fileref	*ref;
 	u_int64_t		mtime;
 
 	TAILQ_FOREACH(ref, &refs, list) {
-		if (!strcmp(ref->path, path)) {
+		if (!strcmp(ref->path, path) && ref->ontls == ontls) {
 			if (stat(ref->path, &st) == -1) {
 				if (errno != ENOENT) {
 					kore_log(LOG_ERR, "stat(%s): %s",

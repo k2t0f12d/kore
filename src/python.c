@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2016 Stanislav Yudin <stan@endlessinsomnia.com>
- * Copyright (c) 2017-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2017-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -24,7 +24,12 @@
 
 #include <ctype.h>
 #include <libgen.h>
+#include <inttypes.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdarg.h>
+#include <stddef.h>
 
 #include "kore.h"
 #include "http.h"
@@ -33,14 +38,60 @@
 #include "pgsql.h"
 #endif
 
+#if defined(KORE_USE_CURL)
+#include "curl.h"
+#endif
+
+#if defined(KORE_USE_ACME)
+#include "acme.h"
+#endif
+
 #include "python_api.h"
 #include "python_methods.h"
 
-static PyMODINIT_FUNC	python_module_init(void);
+#if defined(KORE_USE_CURL)
+#include "python_curlopt.h"
+#endif
+
+#include <frameobject.h>
+
+#if PY_VERSION_HEX >= 0x030b0000
+#include <internal/pycore_frame.h>
+#endif
+
+#if PY_VERSION_HEX < 0x030A0000
+typedef enum {
+	PYGEN_RETURN = 0,
+	PYGEN_ERROR = -1,
+	PYGEN_NEXT = 1,
+} PySendResult;
+#endif
+
+struct reqcall {
+	PyObject		*f;
+	TAILQ_ENTRY(reqcall)	list;
+};
+
+union deconst {
+	char		*p;
+	const char	*cp;
+};
+
+TAILQ_HEAD(reqcall_list, reqcall);
+
+PyMODINIT_FUNC		python_module_init(void);
+
 static PyObject		*python_import(const char *);
+static int		python_resolve_frame_line(void *);
 static PyObject		*pyconnection_alloc(struct connection *);
 static PyObject		*python_callable(PyObject *, const char *);
 static void		python_split_arguments(char *, char **, size_t);
+static void		python_kore_recvobj(struct kore_msg *, const void *);
+
+static PyObject		*python_cmsg_to_list(struct msghdr *);
+static const char	*python_string_from_dict(PyObject *, const char *);
+static int		python_bool_from_dict(PyObject *, const char *, int *);
+static int		python_long_from_dict(PyObject *, const char *, long *);
 
 static int		pyhttp_response_sent(struct netbuf *);
 static PyObject		*pyhttp_file_alloc(struct http_file *);
@@ -48,9 +99,22 @@ static PyObject		*pyhttp_request_alloc(const struct http_request *);
 
 static struct python_coro	*python_coro_create(PyObject *,
 				    struct http_request *);
-static int			python_coro_run(struct python_coro *);
-static void			python_coro_wakeup(struct python_coro *);
-static void			python_coro_suspend(struct python_coro *);
+static struct kore_domain	*python_route_domain_resolve(struct pyroute *);
+
+static int		python_route_install(struct pyroute *);
+static int		python_route_params(PyObject *, struct kore_route *,
+			    const char *, int, int);
+static int		python_route_methods(PyObject *, PyObject *,
+			    struct kore_route *);
+static int		python_route_auth(PyObject *, struct kore_route *);
+static int		python_route_hooks(PyObject *, struct kore_route *);
+static int		python_route_hook_set(PyObject *, const char *,
+			    struct kore_runtime_call **);
+
+static int		python_coro_run(struct python_coro *);
+static void		python_coro_wakeup(struct python_coro *);
+static void		python_coro_suspend(struct python_coro *);
+static void		python_coro_trace(const char *, struct python_coro *);
 
 static void		pysocket_evt_handle(void *, int);
 static void		pysocket_op_timeout(void *, u_int64_t);
@@ -72,9 +136,30 @@ static void		pysuspend_wakeup(void *, u_int64_t);
 static void		pygather_reap_coro(struct pygather_op *,
 			    struct python_coro *);
 
+static int		pyhttp_preprocess(struct http_request *);
+static int		pyhttp_iterobj_chunk_sent(struct netbuf *);
+static int		pyhttp_iterobj_next(struct pyhttp_iterobj *);
+static void		pyhttp_iterobj_disconnect(struct connection *);
+
+static int		pyconnection_x509_cb(void *, int, int, const char *,
+			    const void *, size_t, int);
+
 #if defined(KORE_USE_PGSQL)
-static PyObject		*pykore_pgsql_alloc(struct http_request *,
-			    const char *, const char *);
+static int		pykore_pgsql_result(struct pykore_pgsql *);
+static void		pykore_pgsql_callback(struct kore_pgsql *, void *);
+static int		pykore_pgsql_params(struct pykore_pgsql *, PyObject *);
+static int		pykore_pgsql_params(struct pykore_pgsql *, PyObject *);
+#endif
+
+#if defined(KORE_USE_CURL)
+static void		python_curl_http_callback(struct kore_curl *, void *);
+static void		python_curl_handle_callback(struct kore_curl *, void *);
+static PyObject		*pyhttp_client_request(struct pyhttp_client *, int,
+			    PyObject *);
+static PyObject		*python_curlopt_set(struct pycurl_data *,
+			    long, PyObject *);
+static int		python_curlopt_from_dict(struct pycurl_data *,
+			    PyObject *);
 #endif
 
 static void	python_append_path(const char *);
@@ -82,13 +167,18 @@ static void	python_push_integer(PyObject *, const char *, long);
 static void	python_push_type(const char *, PyObject *, PyTypeObject *);
 
 static int	python_validator_check(PyObject *);
+static int	python_runtime_resolve(const char *, const struct stat *);
 static int	python_runtime_http_request(void *, struct http_request *);
+static void	python_runtime_http_request_free(void *, struct http_request *);
+static void	python_runtime_http_body_chunk(void *, struct http_request *,
+		    const void *, size_t);
 static int	python_runtime_validator(void *, struct http_request *,
 		    const void *);
 static void	python_runtime_wsmessage(void *, struct connection *,
 		    u_int8_t, const void *, size_t);
 static void	python_runtime_execute(void *);
 static int	python_runtime_onload(void *, int);
+static void	python_runtime_signal(void *, int);
 static void	python_runtime_configure(void *, int, char **);
 static void	python_runtime_connect(void *, struct connection *);
 
@@ -111,12 +201,16 @@ struct kore_module_functions kore_python_module = {
 
 struct kore_runtime kore_python_runtime = {
 	KORE_RUNTIME_PYTHON,
+	.resolve = python_runtime_resolve,
 	.http_request = python_runtime_http_request,
+	.http_body_chunk = python_runtime_http_body_chunk,
+	.http_request_free = python_runtime_http_request_free,
 	.validator = python_runtime_validator,
 	.wsconnect = python_runtime_connect,
 	.wsmessage = python_runtime_wsmessage,
 	.wsdisconnect = python_runtime_connect,
 	.onload = python_runtime_onload,
+	.signal = python_runtime_signal,
 	.connect = python_runtime_connect,
 	.execute = python_runtime_execute,
 	.configure = python_runtime_configure,
@@ -161,9 +255,60 @@ static PyMemAllocatorEx allocator = {
 	.free = python_free
 };
 
+#if defined(__linux__)
+#include "seccomp.h"
+
+static struct sock_filter filter_python[] = {
+	/* Required for kore.proc */
+#if defined(SYS_dup2)
+	KORE_SYSCALL_ALLOW(dup2),
+#endif
+#if defined(SYS_dup3)
+	KORE_SYSCALL_ALLOW(dup3),
+#endif
+#if defined(SYS_pipe)
+	KORE_SYSCALL_ALLOW(pipe),
+#endif
+#if defined(SYS_pipe2)
+	KORE_SYSCALL_ALLOW(pipe2),
+#endif
+	KORE_SYSCALL_ALLOW(wait4),
+	KORE_SYSCALL_ALLOW(execve),
+
+	/* Socket related. */
+	KORE_SYSCALL_ALLOW(bind),
+	KORE_SYSCALL_ALLOW(listen),
+	KORE_SYSCALL_ALLOW(sendto),
+	KORE_SYSCALL_ALLOW(recvfrom),
+	KORE_SYSCALL_ALLOW(getsockname),
+	KORE_SYSCALL_ALLOW(getpeername),
+	KORE_SYSCALL_ALLOW_ARG(socket, 0, AF_INET),
+	KORE_SYSCALL_ALLOW_ARG(socket, 0, AF_INET6),
+	KORE_SYSCALL_ALLOW_ARG(socket, 0, AF_UNIX),
+};
+
+#define PYSECCOMP_ACTION_ALLOW		1
+#define PYSECCOMP_ACTION_DENY		2
+
+#define PYSECCOMP_SYSCALL_FILTER	1
+#define PYSECCOMP_SYSCALL_ARG		2
+#define PYSECCOMP_SYSCALL_MASK		3
+#define PYSECCOMP_SYSCALL_FLAG		4
+
+static int	pyseccomp_filter_install(struct pyseccomp *,
+		    const char *, int, int, int, int);
+static PyObject	*pyseccomp_common_action(struct pyseccomp *, PyObject *,
+		    PyObject *, int, int);
+
+static struct pyseccomp			*py_seccomp = NULL;
+#endif
+
 static TAILQ_HEAD(, pyproc)		procs;
+static TAILQ_HEAD(, pyroute)		routes;
+static struct reqcall_list		prereq;
 
 static struct kore_pool			coro_pool;
+static struct kore_pool			iterobj_pool;
 static struct kore_pool			queue_wait_pool;
 static struct kore_pool			gather_coro_pool;
 static struct kore_pool			queue_object_pool;
@@ -171,14 +316,24 @@ static struct kore_pool			gather_result_pool;
 
 static u_int64_t			coro_id;
 static int				coro_count;
+static int				coro_tracing;
 static struct coro_list			coro_runnable;
 static struct coro_list			coro_suspended;
 
 extern const char *__progname;
 
+static PyObject		*pickle = NULL;
+static PyObject		*kore_app = NULL;
+static PyObject		*pickle_dumps = NULL;
+static PyObject		*pickle_loads = NULL;
+static PyObject		*python_tracer = NULL;
+
 /* XXX */
 static struct python_coro		*coro_running = NULL;
-static PyObject				*python_tracer = NULL;
+
+#if !defined(KORE_SINGLE_BINARY)
+static const char	*kore_pymodule = NULL;
+#endif
 
 void
 kore_python_init(void)
@@ -187,13 +342,19 @@ kore_python_init(void)
 
 	coro_id = 0;
 	coro_count = 0;
+	coro_tracing = 0;
+
+	TAILQ_INIT(&prereq);
 
 	TAILQ_INIT(&procs);
+	TAILQ_INIT(&routes);
 	TAILQ_INIT(&coro_runnable);
 	TAILQ_INIT(&coro_suspended);
 
 	kore_pool_init(&coro_pool, "coropool", sizeof(struct python_coro), 100);
 
+	kore_pool_init(&iterobj_pool, "iterobj_pool",
+	    sizeof(struct pyhttp_iterobj), 100);
 	kore_pool_init(&queue_wait_pool, "queue_wait_pool",
 	    sizeof(struct pyqueue_waiting), 100);
 	kore_pool_init(&gather_coro_pool, "gather_coro_pool",
@@ -206,7 +367,12 @@ kore_python_init(void)
 	PyMem_SetAllocator(PYMEM_DOMAIN_OBJ, &allocator);
 	PyMem_SetAllocator(PYMEM_DOMAIN_MEM, &allocator);
 	PyMem_SetAllocator(PYMEM_DOMAIN_RAW, &allocator);
+
+#if defined(KORE_DEBUG)
 	PyMem_SetupDebugHooks();
+#endif
+
+	kore_msg_register(KORE_PYTHON_SEND_OBJ, python_kore_recvobj);
 
 	if (PyImport_AppendInittab("kore", &python_module_init) == -1)
 		fatal("kore_python_init: failed to add new module");
@@ -217,7 +383,28 @@ kore_python_init(void)
 		kore_free(rcall);
 	}
 
-	Py_Initialize();
+	Py_InitializeEx(0);
+
+	if ((pickle = PyImport_ImportModule("pickle")) == NULL)
+		fatal("failed to import pickle module");
+
+	if ((pickle_dumps = PyObject_GetAttrString(pickle, "dumps")) == NULL)
+		fatal("pickle module has no dumps method");
+
+	if ((pickle_loads = PyObject_GetAttrString(pickle, "loads")) == NULL)
+		fatal("pickle module has no loads method");
+
+#if defined(__linux__)
+	kore_seccomp_filter("python", filter_python,
+	    KORE_FILTER_LEN(filter_python));
+#endif
+
+#if !defined(KORE_SINGLE_BINARY)
+	if (kore_pymodule) {
+		if (!kore_configure_setting("deployment", "dev"))
+			fatal("failed to set initial deployment");
+	}
+#endif
 }
 
 void
@@ -267,6 +454,14 @@ kore_python_coro_run(void)
 	 * to HTTP requests was awoken and only run if true?
 	 */
 	http_process();
+
+#if defined(KORE_USE_CURL)
+	/*
+	 * If a coroutine fired off a curl instance, immediately
+	 * let it make progress.
+	 */
+	kore_curl_do_timeout();
+#endif
 }
 
 void
@@ -277,7 +472,17 @@ kore_python_coro_delete(void *obj)
 	coro = obj;
 	coro_count--;
 
+	python_coro_trace(coro->killed ? "killed" : "deleted", coro);
+
 	coro_running = coro;
+
+	if (coro->lockop != NULL) {
+		coro->lockop->active = 0;
+		TAILQ_REMOVE(&coro->lockop->lock->ops, coro->lockop, list);
+		Py_DECREF((PyObject *)coro->lockop);
+		coro->lockop = NULL;
+	}
+
 	Py_DECREF(coro->obj);
 	coro_running = NULL;
 
@@ -286,8 +491,29 @@ kore_python_coro_delete(void *obj)
 	else
 		TAILQ_REMOVE(&coro_suspended, coro, list);
 
+	kore_free(coro->name);
 	Py_XDECREF(coro->result);
+
 	kore_pool_put(&coro_pool, coro);
+}
+
+int
+kore_python_coro_pending(void)
+{
+	return (!TAILQ_EMPTY(&coro_runnable));
+}
+
+void
+kore_python_routes_resolve(void)
+{
+	struct pyroute		*route;
+
+	while ((route = TAILQ_FIRST(&routes)) != NULL) {
+		TAILQ_REMOVE(&routes, route, list);
+		if (!python_route_install(route))
+			fatalx("failed to install route for %s", route->path);
+		Py_DECREF((PyObject *)route);
+	}
 }
 
 void
@@ -345,6 +571,7 @@ void
 kore_python_proc_reap(void)
 {
 	struct pyproc		*proc;
+	struct python_coro	*coro;
 	pid_t			child;
 	int			status;
 
@@ -380,11 +607,346 @@ kore_python_proc_reap(void)
 			proc->timer = NULL;
 		}
 
-		if (proc->coro->request != NULL)
-			http_request_wakeup(proc->coro->request);
+		/*
+		 * If someone is waiting on proc.reap() then wakeup that
+		 * coroutine, otherwise wakeup the coroutine that created
+		 * the process.
+		 */
+		if (proc->op != NULL)
+			coro = proc->op->coro;
 		else
-			python_coro_wakeup(proc->coro);
+			coro = proc->coro;
+
+		if (coro->request != NULL)
+			http_request_wakeup(coro->request);
+		else
+			python_coro_wakeup(coro);
 	}
+}
+
+#if defined(__linux__)
+void
+kore_python_seccomp_hook(const char *method)
+{
+	struct kore_runtime	*rt;
+	PyObject		*func, *result;
+
+	if ((func = kore_module_getsym(method, &rt)) == NULL)
+		return;
+
+	if (rt->type != KORE_RUNTIME_PYTHON)
+		return;
+
+	py_seccomp = PyObject_New(struct pyseccomp, &pyseccomp_type);
+	if (py_seccomp == NULL)
+		fatal("failed to create seccomp object");
+
+	py_seccomp->elm = 0;
+	py_seccomp->filters = NULL;
+
+	result = PyObject_CallFunctionObjArgs(func,
+	    (PyObject *)py_seccomp, NULL);
+	kore_python_log_error(method);
+
+	kore_seccomp_filter("koreapp", py_seccomp->filters, py_seccomp->elm);
+
+	Py_XDECREF(result);
+}
+
+void
+kore_python_seccomp_cleanup(void)
+{
+	Py_XDECREF(py_seccomp);
+	py_seccomp = NULL;
+}
+
+static void
+pyseccomp_dealloc(struct pyseccomp *seccomp)
+{
+	kore_free(seccomp->filters);
+
+	seccomp->elm = 0;
+	seccomp->filters = NULL;
+}
+
+static PyObject *
+pyseccomp_bpf_stmt(struct pyseccomp *seccomp, PyObject *args)
+{
+	u_int32_t		k;
+	u_int16_t		code;
+	size_t			len, off;
+	struct sock_filter	filter[1];
+
+	if (!PyArg_ParseTuple(args, "HI", &code, &k))
+		return (NULL);
+
+	filter[0].k = k;
+	filter[0].jt = 0;
+	filter[0].jf = 0;
+	filter[0].code = code;
+
+	len = sizeof(struct sock_filter);
+	off = seccomp->elm * sizeof(struct sock_filter);
+	seccomp->filters = kore_realloc(seccomp->filters, off + len);
+
+	memcpy(seccomp->filters + off, filter, len);
+	seccomp->elm += 1;
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+pyseccomp_allow(struct pyseccomp *seccomp, PyObject *args)
+{
+	const char		*syscall;
+
+	if (!PyArg_ParseTuple(args, "s", &syscall))
+		return (NULL);
+
+	if (!pyseccomp_filter_install(seccomp, syscall,
+	    PYSECCOMP_SYSCALL_FILTER, 0, 0, SECCOMP_RET_ALLOW))
+		return (NULL);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+pyseccomp_allow_arg(struct pyseccomp *seccomp, PyObject *args)
+{
+	return (pyseccomp_common_action(seccomp, args, NULL,
+	    PYSECCOMP_SYSCALL_ARG, PYSECCOMP_ACTION_ALLOW));
+}
+
+static PyObject *
+pyseccomp_allow_flag(struct pyseccomp *seccomp, PyObject *args)
+{
+	return (pyseccomp_common_action(seccomp, args, NULL,
+	    PYSECCOMP_SYSCALL_FLAG, PYSECCOMP_ACTION_ALLOW));
+}
+
+static PyObject *
+pyseccomp_allow_mask(struct pyseccomp *seccomp, PyObject *args)
+{
+	return (pyseccomp_common_action(seccomp, args, NULL,
+	    PYSECCOMP_SYSCALL_MASK, PYSECCOMP_ACTION_ALLOW));
+}
+
+static PyObject *
+pyseccomp_deny(struct pyseccomp *seccomp, PyObject *args, PyObject *kwargs)
+{
+	long			err;
+	const char		*syscall;
+
+	if (!PyArg_ParseTuple(args, "s", &syscall))
+		return (NULL);
+
+	err = EACCES;
+
+	if (kwargs != NULL)
+		python_long_from_dict(kwargs, "errno", &err);
+
+	if (!pyseccomp_filter_install(seccomp, syscall,
+	    PYSECCOMP_SYSCALL_FILTER, 0, 0, SECCOMP_RET_ERRNO | (int)err))
+		return (NULL);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+pyseccomp_deny_arg(struct pyseccomp *seccomp, PyObject *args, PyObject *kwargs)
+{
+	return (pyseccomp_common_action(seccomp, args, kwargs,
+	    PYSECCOMP_SYSCALL_ARG, PYSECCOMP_ACTION_DENY));
+}
+
+static PyObject *
+pyseccomp_deny_flag(struct pyseccomp *seccomp, PyObject *args, PyObject *kwargs)
+{
+	return (pyseccomp_common_action(seccomp, args, kwargs,
+	    PYSECCOMP_SYSCALL_FLAG, PYSECCOMP_ACTION_DENY));
+}
+
+static PyObject *
+pyseccomp_deny_mask(struct pyseccomp *seccomp, PyObject *args, PyObject *kwargs)
+{
+	return (pyseccomp_common_action(seccomp, args, kwargs,
+	    PYSECCOMP_SYSCALL_MASK, PYSECCOMP_ACTION_DENY));
+}
+
+static PyObject *
+pyseccomp_common_action(struct pyseccomp *sc, PyObject *args,
+    PyObject *kwargs, int which, int action)
+{
+	long			err;
+	const char		*syscall;
+	int			arg, val;
+
+	if (!PyArg_ParseTuple(args, "sii", &syscall, &arg, &val))
+		return (NULL);
+
+	switch (action) {
+	case PYSECCOMP_ACTION_ALLOW:
+		action = SECCOMP_RET_ALLOW;
+		break;
+	case PYSECCOMP_ACTION_DENY:
+		err = EACCES;
+		if (kwargs != NULL)
+			python_long_from_dict(kwargs, "errno", &err);
+		action = SECCOMP_RET_ERRNO | (int)err;
+		break;
+	default:
+		fatal("%s: bad action %d", __func__, action);
+	}
+
+	if (!pyseccomp_filter_install(sc, syscall, which, arg, val, action))
+		return (NULL);
+
+	Py_RETURN_NONE;
+}
+
+static int
+pyseccomp_filter_install(struct pyseccomp *seccomp, const char *syscall,
+    int which, int arg, int val, int action)
+{
+	struct sock_filter	*filter;
+	size_t			elm, len, off;
+
+	switch (which) {
+	case PYSECCOMP_SYSCALL_FILTER:
+		filter = kore_seccomp_syscall_filter(syscall, action);
+		break;
+	case PYSECCOMP_SYSCALL_ARG:
+		filter = kore_seccomp_syscall_arg(syscall, action, arg, val);
+		break;
+	case PYSECCOMP_SYSCALL_MASK:
+		filter = kore_seccomp_syscall_mask(syscall, action, arg, val);
+		break;
+	case PYSECCOMP_SYSCALL_FLAG:
+		filter = kore_seccomp_syscall_flag(syscall, action, arg, val);
+		break;
+	default:
+		fatal("%s: invalid syscall instruction %d", __func__, which);
+	}
+
+	if (filter == NULL) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "system call '%s' does not exist", syscall);
+		return (KORE_RESULT_ERROR);
+	}
+
+	elm = 0;
+
+	/*
+	 * Find the number of elements in the BPF program, by looking for
+	 * the KORE_BPF_GUARD element.
+	 */
+	for (;;) {
+		if (filter[elm].code == USHRT_MAX &&
+		    filter[elm].jt == UCHAR_MAX &&
+		    filter[elm].jf == UCHAR_MAX &&
+		    filter[elm].k == UINT_MAX)
+			break;
+
+		elm++;
+	}
+
+	len = elm * sizeof(struct sock_filter);
+	off = seccomp->elm * sizeof(struct sock_filter);
+	seccomp->filters = kore_realloc(seccomp->filters, off + len);
+
+	memcpy(seccomp->filters + off, filter, len);
+	seccomp->elm += elm;
+
+	kore_free(filter);
+
+	return (KORE_RESULT_OK);
+}
+#endif
+
+static int
+python_long_from_dict(PyObject *dict, const char *key, long *result)
+{
+	PyObject	*obj;
+
+	if ((obj = PyDict_GetItemString(dict, key)) == NULL)
+		return (KORE_RESULT_ERROR);
+
+	if (!PyLong_CheckExact(obj))
+		return (KORE_RESULT_ERROR);
+
+	PyErr_Clear();
+	*result = PyLong_AsLong(obj);
+	if (*result == -1 && PyErr_Occurred()) {
+		PyErr_Clear();
+		return (KORE_RESULT_ERROR);
+	}
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+python_bool_from_dict(PyObject *dict, const char *key, int *result)
+{
+	PyObject	*obj;
+
+	if ((obj = PyDict_GetItemString(dict, key)) == NULL)
+		return (KORE_RESULT_ERROR);
+
+	if (!PyBool_Check(obj))
+		return (KORE_RESULT_ERROR);
+
+	*result = (obj == Py_True);
+
+	return (KORE_RESULT_OK);
+}
+
+static const char *
+python_string_from_dict(PyObject *dict, const char *key)
+{
+	PyObject	*obj;
+
+	if ((obj = PyDict_GetItemString(dict, key)) == NULL)
+		return (NULL);
+
+	if (!PyUnicode_Check(obj))
+		return (NULL);
+
+	return (PyUnicode_AsUTF8AndSize(obj, NULL));
+}
+
+static PyObject *
+python_cmsg_to_list(struct msghdr *msg)
+{
+	struct cmsghdr		*c;
+	size_t			len;
+	Py_ssize_t		idx;
+	PyObject		*list, *tuple;
+
+	if ((list = PyList_New(0)) == NULL)
+		return (NULL);
+
+	idx = 0;
+
+	for (c = CMSG_FIRSTHDR(msg); c != NULL; c = CMSG_NXTHDR(msg, c)) {
+		len = c->cmsg_len - sizeof(*c);
+
+		tuple = Py_BuildValue("(Iiiy#)", len,
+		    c->cmsg_level, c->cmsg_type, CMSG_DATA(c), len);
+
+		if (tuple == NULL) {
+			Py_DECREF(list);
+			return (NULL);
+		}
+
+		/* Steals a reference to tuple. */
+		if (PyList_Insert(list, idx++, tuple) == -1) {
+			Py_DECREF(tuple);
+			Py_DECREF(list);
+			return (NULL);
+		}
+	}
+
+	return (list);
 }
 
 static void *
@@ -506,21 +1068,26 @@ python_coro_create(PyObject *obj, struct http_request *req)
 	coro = kore_pool_get(&coro_pool);
 	coro_count++;
 
+	coro->name = NULL;
 	coro->result = NULL;
 	coro->sockop = NULL;
+	coro->lockop = NULL;
 	coro->gatherop = NULL;
 	coro->exception = NULL;
 	coro->exception_msg = NULL;
 
 	coro->obj = obj;
+	coro->killed = 0;
 	coro->request = req;
 	coro->id = coro_id++;
 	coro->state = CORO_STATE_RUNNABLE;
 
-	TAILQ_INSERT_HEAD(&coro_runnable, coro, list);
+	TAILQ_INSERT_TAIL(&coro_runnable, coro, list);
 
 	if (coro->request != NULL)
 		http_request_sleep(coro->request);
+
+	python_coro_trace("created", coro);
 
 	return (coro);
 }
@@ -528,6 +1095,7 @@ python_coro_create(PyObject *obj, struct http_request *req)
 static int
 python_coro_run(struct python_coro *coro)
 {
+	PySendResult	res;
 	PyObject	*item;
 	PyObject	*type, *traceback;
 
@@ -537,22 +1105,48 @@ python_coro_run(struct python_coro *coro)
 	coro_running = coro;
 
 	for (;;) {
-		PyErr_Clear();
+		python_coro_trace("running", coro);
 
+		PyErr_Clear();
+#if PY_VERSION_HEX < 0x030A0000
+		res = PYGEN_RETURN;
 		item = _PyGen_Send((PyGenObject *)coro->obj, NULL);
-		if (item == NULL) {
+#else
+		/*
+		 * Python 3.10.x its PyIter_Send() will return a PYGEN_ERROR
+		 * if the coro returned (instead of yielding) and the result
+		 * ends up being Py_None. This means the returned item is
+		 * NULL but no StopIteration exception has occurred.
+		 */
+		res = PyIter_Send(coro->obj, NULL, &item);
+#endif
+		if (item == NULL || res == PYGEN_ERROR) {
+			Py_XDECREF(item);
 			if (coro->gatherop == NULL && PyErr_Occurred() &&
 			    PyErr_ExceptionMatches(PyExc_StopIteration)) {
 				PyErr_Fetch(&type, &coro->result, &traceback);
 				Py_DECREF(type);
 				Py_XDECREF(traceback);
-			} else {
+			} else if (PyErr_Occurred()) {
 				kore_python_log_error("coroutine");
+				if (coro->request != NULL) {
+					http_response(coro->request,
+					    HTTP_STATUS_INTERNAL_ERROR,
+					    NULL, 0);
+				}
 			}
 
 			coro_running = NULL;
 			return (KORE_RESULT_OK);
 		}
+
+#if PY_VERSION_HEX >= 0x030A0000
+		if (res == PYGEN_RETURN) {
+			coro->result = item;
+			coro_running = NULL;
+			return (KORE_RESULT_OK);
+		}
+#endif
 
 		if (item == Py_None) {
 			Py_DECREF(item);
@@ -579,7 +1173,9 @@ python_coro_wakeup(struct python_coro *coro)
 
 	coro->state = CORO_STATE_RUNNABLE;
 	TAILQ_REMOVE(&coro_suspended, coro, list);
-	TAILQ_INSERT_HEAD(&coro_runnable, coro, list);
+	TAILQ_INSERT_TAIL(&coro_runnable, coro, list);
+
+	python_coro_trace("wokeup", coro);
 }
 
 static void
@@ -590,7 +1186,78 @@ python_coro_suspend(struct python_coro *coro)
 
 	coro->state = CORO_STATE_SUSPENDED;
 	TAILQ_REMOVE(&coro_runnable, coro, list);
-	TAILQ_INSERT_HEAD(&coro_suspended, coro, list);
+	TAILQ_INSERT_TAIL(&coro_suspended, coro, list);
+
+	python_coro_trace("suspended", coro);
+}
+
+static int
+python_resolve_frame_line(void *ptr)
+{
+	int			line;
+#if PY_VERSION_HEX >= 0x030b0000
+	int			addr;
+	_PyInterpreterFrame	*frame;
+
+	frame = ptr;
+	addr = _PyInterpreterFrame_LASTI(frame) * sizeof(_Py_CODEUNIT);
+	line = PyCode_Addr2Line(frame->f_code, addr);
+#else
+	line = PyFrame_GetLineNumber(ptr);
+#endif
+
+	return (line);
+}
+
+static void
+python_coro_trace(const char *label, struct python_coro *coro)
+{
+	int			line;
+	PyCoroObject		*obj;
+	PyCodeObject		*code;
+#if PY_VERSION_HEX >= 0x030b0000
+	_PyInterpreterFrame	*frame;
+#else
+	PyFrameObject		*frame;
+#endif
+	const char		*func, *fname, *file;
+
+	if (coro_tracing == 0)
+		return;
+
+	obj = (PyCoroObject *)coro->obj;
+
+#if PY_VERSION_HEX >= 0x030b0000
+	frame = (_PyInterpreterFrame *)obj->cr_iframe;
+#else
+	frame = obj->cr_frame;
+#endif
+	if (frame != NULL && frame->f_code != NULL) {
+		code = frame->f_code;
+		func = PyUnicode_AsUTF8AndSize(code->co_name, NULL);
+		file = PyUnicode_AsUTF8AndSize(code->co_filename, NULL);
+
+		if ((fname = strrchr(file, '/')) == NULL)
+			fname = file;
+		else
+			fname++;
+	} else {
+		func = "unknown";
+		fname = "unknown";
+	}
+
+	if (frame != NULL)
+		line = python_resolve_frame_line(frame);
+	else
+		line = -1;
+
+	if (coro->name) {
+		kore_log(LOG_NOTICE, "coro '%s' %s <%s> @ [%s:%d]",
+		    coro->name, label, func, fname, line);
+	} else {
+		kore_log(LOG_NOTICE, "coro %" PRIu64 " %s <%s> @ [%s:%d]",
+		    coro->id, label, func, fname, line);
+	}
 }
 
 static void
@@ -602,6 +1269,7 @@ pyconnection_dealloc(struct pyconnection *pyc)
 static void
 pyhttp_dealloc(struct pyhttp_request *pyreq)
 {
+	Py_XDECREF(pyreq->dict);
 	Py_XDECREF(pyreq->data);
 	PyObject_Del((PyObject *)pyreq);
 }
@@ -613,30 +1281,123 @@ pyhttp_file_dealloc(struct pyhttp_file *pyfile)
 }
 
 static int
+python_runtime_resolve(const char *module, const struct stat *st)
+{
+	const char		*ext;
+
+	if (!S_ISDIR(st->st_mode) && !S_ISREG(st->st_mode))
+		return (KORE_RESULT_ERROR);
+
+	if (S_ISDIR(st->st_mode)) {
+		kore_module_load(module, NULL, KORE_MODULE_PYTHON);
+		if (chdir(module) == -1)
+			fatal("chdir(%s): %s", module, errno_s);
+	} else {
+		if ((ext = strrchr(module, '.')) == NULL)
+			return (KORE_RESULT_ERROR);
+
+		if (strcasecmp(ext, ".py"))
+			return (KORE_RESULT_ERROR);
+
+		kore_module_load(module, NULL, KORE_MODULE_PYTHON);
+	}
+
+#if !defined(KORE_SINGLE_BINARY)
+	kore_pymodule = module;
+#endif
+
+	kore_hooks_set(KORE_PYTHON_CONFIG_HOOK,
+	    KORE_PYTHON_TEARDOWN_HOOK, KORE_PYTHON_DAEMONIZED_HOOK);
+
+	return (KORE_RESULT_OK);
+}
+
+static int
 python_runtime_http_request(void *addr, struct http_request *req)
 {
-	PyObject	*pyret, *pyreq, *args, *callable;
+	int			ret, idx, cnt;
+	PyObject		*pyret, *args, *callable;
+	PyObject		*cargs[HTTP_CAPTURE_GROUPS + 1];
 
 	if (req->py_coro != NULL) {
 		python_coro_wakeup(req->py_coro);
 		if (python_coro_run(req->py_coro) == KORE_RESULT_OK) {
 			kore_python_coro_delete(req->py_coro);
 			req->py_coro = NULL;
-			return (KORE_RESULT_OK);
+
+			if (req->fsm_state != PYHTTP_STATE_PREPROCESS)
+				return (KORE_RESULT_OK);
 		}
 		return (KORE_RESULT_RETRY);
 	}
 
+	switch (req->fsm_state) {
+	case PYHTTP_STATE_INIT:
+		req->py_rqnext = TAILQ_FIRST(&prereq);
+		req->fsm_state = PYHTTP_STATE_PREPROCESS;
+		if (req->py_req == NULL) {
+			if ((req->py_req = pyhttp_request_alloc(req)) == NULL)
+				fatal("%s: pyreq alloc failed", __func__);
+		}
+		/* fallthrough */
+	case PYHTTP_STATE_PREPROCESS:
+		ret = pyhttp_preprocess(req);
+		switch (ret) {
+		case KORE_RESULT_OK:
+			req->fsm_state = PYHTTP_STATE_RUN;
+			break;
+		case KORE_RESULT_RETRY:
+			return (KORE_RESULT_RETRY);
+		case KORE_RESULT_ERROR:
+			return (KORE_RESULT_OK);
+		default:
+			fatal("invalid state pyhttp state %d", req->fsm_state);
+		}
+		/* fallthrough */
+	case PYHTTP_STATE_RUN:
+		break;
+	}
+
+	cnt = 0;
 	callable = (PyObject *)addr;
 
-	if ((pyreq = pyhttp_request_alloc(req)) == NULL)
-		fatal("python_runtime_http_request: pyreq alloc failed");
+	/* starts at 1 to skip the full path. */
+	if (req->rt->type == HANDLER_TYPE_DYNAMIC) {
+		for (idx = 1; idx < HTTP_CAPTURE_GROUPS - 1; idx++) {
+			if (req->cgroups[idx].rm_so == -1 ||
+			    req->cgroups[idx].rm_eo == -1)
+				break;
 
-	if ((args = PyTuple_New(1)) == NULL)
-		fatal("python_runtime_http_request: PyTuple_New failed");
+			cargs[cnt] = PyUnicode_FromStringAndSize(req->path +
+			    req->cgroups[idx].rm_so,
+			    req->cgroups[idx].rm_eo - req->cgroups[idx].rm_so);
 
-	if (PyTuple_SetItem(args, 0, pyreq) != 0)
+			if (cargs[cnt] == NULL) {
+				while (cnt >= 0)
+					Py_XDECREF(cargs[cnt--]);
+				kore_python_log_error("http request");
+				http_response(req,
+				    HTTP_STATUS_INTERNAL_ERROR, NULL, 0);
+				return (KORE_RESULT_OK);
+			}
+
+			cnt++;
+		}
+	}
+
+	cargs[cnt] = NULL;
+
+	if ((args = PyTuple_New(cnt + 1)) == NULL)
+		fatal("%s: PyTuple_New failed", __func__);
+
+	Py_INCREF(req->py_req);
+	if (PyTuple_SetItem(args, 0, req->py_req) != 0)
 		fatal("python_runtime_http_request: PyTuple_SetItem failed");
+
+	for (idx = 0; cargs[idx] != NULL; idx++) {
+		if (PyTuple_SetItem(args, 1 + idx, cargs[idx]) != 0)
+			fatal("%s: PyTuple_SetItem failed (%d)", __func__, idx);
+	}
 
 	PyErr_Clear();
 	pyret = PyObject_Call(callable, args, NULL);
@@ -651,11 +1412,11 @@ python_runtime_http_request(void *addr, struct http_request *req)
 	if (PyCoro_CheckExact(pyret)) {
 		req->py_coro = python_coro_create(pyret, req);
 		if (python_coro_run(req->py_coro) == KORE_RESULT_OK) {
+			http_request_wakeup(req);
 			kore_python_coro_delete(req->py_coro);
 			req->py_coro = NULL;
 			return (KORE_RESULT_OK);
 		}
-		http_request_sleep(req);
 		return (KORE_RESULT_RETRY);
 	}
 
@@ -667,20 +1428,70 @@ python_runtime_http_request(void *addr, struct http_request *req)
 	return (KORE_RESULT_OK);
 }
 
+static void
+python_runtime_http_request_free(void *addr, struct http_request *req)
+{
+	PyObject	*ret;
+
+	if (req->py_req == NULL) {
+		if ((req->py_req = pyhttp_request_alloc(req)) == NULL)
+			fatal("%s: pyreq alloc failed", __func__);
+	}
+
+	PyErr_Clear();
+	ret = PyObject_CallFunctionObjArgs(addr, req->py_req, NULL);
+
+	if (ret == NULL)
+		kore_python_log_error("python_runtime_http_request_free");
+
+	Py_XDECREF(ret);
+}
+
+static void
+python_runtime_http_body_chunk(void *addr, struct http_request *req,
+    const void *data, size_t len)
+{
+	PyObject	*args, *ret;
+
+	if (req->py_req == NULL) {
+		if ((req->py_req = pyhttp_request_alloc(req)) == NULL)
+			fatal("%s: pyreq alloc failed", __func__);
+	}
+
+	if ((args = Py_BuildValue("(Oy#)", req->py_req, data, len)) == NULL) {
+		kore_python_log_error("python_runtime_http_body_chunk");
+		return;
+	}
+
+	PyErr_Clear();
+	ret = PyObject_Call(addr, args, NULL);
+
+	if (ret == NULL)
+		kore_python_log_error("python_runtime_http_body_chunk");
+
+	Py_XDECREF(ret);
+	Py_DECREF(args);
+}
+
 static int
 python_runtime_validator(void *addr, struct http_request *req, const void *data)
 {
 	int			ret;
 	struct python_coro	*coro;
-	PyObject		*pyret, *pyreq, *args, *callable, *arg;
+	PyObject		*pyret, *args, *callable, *arg;
 
-	if (req->py_coro != NULL) {
-		coro = req->py_coro;
+	if (req->py_req == NULL) {
+		if ((req->py_req = pyhttp_request_alloc(req)) == NULL)
+			fatal("%s: pyreq alloc failed", __func__);
+	}
+
+	if (req->py_validator != NULL) {
+		coro = req->py_validator;
 		python_coro_wakeup(coro);
 		if (python_coro_run(coro) == KORE_RESULT_OK) {
 			ret = python_validator_check(coro->result);
 			kore_python_coro_delete(coro);
-			req->py_coro = NULL;
+			req->py_validator = NULL;
 			return (ret);
 		}
 
@@ -690,25 +1501,21 @@ python_runtime_validator(void *addr, struct http_request *req, const void *data)
 	callable = (PyObject *)addr;
 
 	if (req->flags & HTTP_VALIDATOR_IS_REQUEST) {
-		if ((arg = pyhttp_request_alloc(data)) == NULL)
-			fatal("%s: pyreq failed", __func__);
-
 		if ((args = PyTuple_New(1)) == NULL)
 			fatal("%s: PyTuple_New failed", __func__);
 
-		if (PyTuple_SetItem(args, 0, arg) != 0)
+		Py_INCREF(req->py_req);
+		if (PyTuple_SetItem(args, 0, req->py_req) != 0)
 			fatal("%s: PyTuple_SetItem failed", __func__);
 	} else {
-		if ((pyreq = pyhttp_request_alloc(req)) == NULL)
-			fatal("%s: pyreq alloc failed", __func__);
-
 		if ((arg = PyUnicode_FromString(data)) == NULL)
 			fatal("python_runtime_validator: PyUnicode failed");
 
 		if ((args = PyTuple_New(2)) == NULL)
 			fatal("%s: PyTuple_New failed", __func__);
 
-		if (PyTuple_SetItem(args, 0, pyreq) != 0 ||
+		Py_INCREF(req->py_req);
+		if (PyTuple_SetItem(args, 0, req->py_req) != 0 ||
 		    PyTuple_SetItem(args, 1, arg) != 0)
 			fatal("%s: PyTuple_SetItem failed", __func__);
 	}
@@ -724,14 +1531,14 @@ python_runtime_validator(void *addr, struct http_request *req, const void *data)
 
 	if (PyCoro_CheckExact(pyret)) {
 		coro = python_coro_create(pyret, req);
-		req->py_coro = coro;
+		req->py_validator = coro;
 		if (python_coro_run(coro) == KORE_RESULT_OK) {
+			http_request_wakeup(req);
 			ret = python_validator_check(coro->result);
 			kore_python_coro_delete(coro);
-			req->py_coro = NULL;
+			req->py_validator = NULL;
 			return (ret);
 		}
-		http_request_sleep(req);
 		return (KORE_RESULT_RETRY);
 	}
 
@@ -749,24 +1556,16 @@ python_validator_check(PyObject *obj)
 	if (obj == NULL)
 		return (KORE_RESULT_ERROR);
 
-	if (!PyLong_Check(obj)) {
+	if (!PyBool_Check(obj)) {
 		kore_log(LOG_WARNING,
-		    "invalid return value from authenticator (not an int)");
+		    "validator did not return True/False");
 		ret = KORE_RESULT_ERROR;
-	} else {
-		ret = (int)PyLong_AsLong(obj);
 	}
 
-	switch (ret) {
-	case KORE_RESULT_OK:
-	case KORE_RESULT_ERROR:
-		break;
-	default:
-		kore_log(LOG_WARNING,
-		    "unsupported authenticator return value '%d'", ret);
+	if (obj == Py_True)
+		ret = KORE_RESULT_OK;
+	else
 		ret = KORE_RESULT_ERROR;
-		break;
-	}
 
 	return (ret);
 }
@@ -874,11 +1673,10 @@ python_runtime_configure(void *addr, int argc, char **argv)
 	PyErr_Clear();
 	pyret = PyObject_Call(callable, args, NULL);
 	Py_DECREF(args);
-	Py_DECREF(list);
 
 	if (pyret == NULL) {
 		kore_python_log_error("python_runtime_configure");
-		fatal("failed to call configure method: wrong args?");
+		fatal("failed to configure your application");
 	}
 
 	Py_DECREF(pyret);
@@ -947,11 +1745,28 @@ python_runtime_connect(void *addr, struct connection *c)
 	Py_DECREF(pyret);
 }
 
-static PyMODINIT_FUNC
+static void
+python_runtime_signal(void *addr, int sig)
+{
+	PyObject	*obj, *ret;
+
+	if ((obj = Py_BuildValue("i", sig)) == NULL) {
+		kore_python_log_error("python_runtime_signal");
+		return;
+	}
+
+	ret = PyObject_CallFunctionObjArgs(addr, obj, NULL);
+
+	Py_DECREF(obj);
+	Py_XDECREF(ret);
+}
+
+PyMODINIT_FUNC
 python_module_init(void)
 {
-	int		i;
-	PyObject	*pykore;
+	int			i;
+	struct pyconfig		*config;
+	PyObject		*pykore;
 
 	if ((pykore = PyModule_Create(&pykore_module)) == NULL)
 		fatal("python_module_init: failed to setup pykore module");
@@ -960,8 +1775,24 @@ python_module_init(void)
 	python_push_type("pylock", pykore, &pylock_type);
 	python_push_type("pytimer", pykore, &pytimer_type);
 	python_push_type("pyqueue", pykore, &pyqueue_type);
+	python_push_type("pyroute", pykore, &pyroute_type);
 	python_push_type("pysocket", pykore, &pysocket_type);
+	python_push_type("pydomain", pykore, &pydomain_type);
 	python_push_type("pyconnection", pykore, &pyconnection_type);
+
+#if defined(__linux__)
+	python_push_type("pyseccomp", pykore, &pyseccomp_type);
+#endif
+
+#if defined(KORE_USE_CURL)
+	python_push_type("pycurlhandle", pykore, &pycurl_handle_type);
+	python_push_type("pyhttpclient", pykore, &pyhttp_client_type);
+
+	for (i = 0; py_curlopt[i].name != NULL; i++) {
+		python_push_integer(pykore, py_curlopt[i].name,
+		    py_curlopt[i].value);
+	}
+#endif
 
 	python_push_type("pyhttp_file", pykore, &pyhttp_file_type);
 	python_push_type("pyhttp_request", pykore, &pyhttp_request_type);
@@ -971,7 +1802,60 @@ python_module_init(void)
 		    python_integers[i].value);
 	}
 
+	if ((config = PyObject_New(struct pyconfig, &pyconfig_type)) == NULL)
+		fatal("failed to create config object");
+
+	if (PyObject_SetAttrString(pykore, "config", (PyObject *)config) == -1)
+		fatal("failed to add config object");
+
 	return (pykore);
+}
+
+static int
+pyconfig_setattr(PyObject *self, PyObject *attr, PyObject *val)
+{
+	char		*v;
+	int		ret;
+	PyObject	*repr;
+	const char	*name, *value;
+
+	ret = -1;
+	repr = NULL;
+
+	if (!PyUnicode_Check(attr))
+		fatal("setattr: attribute name not a unicode string");
+
+	if (PyLong_CheckExact(val)) {
+		if ((repr = PyObject_Repr(val)) == NULL)
+			return (-1);
+		value = PyUnicode_AsUTF8(repr);
+	} else if (PyUnicode_CheckExact(val)) {
+		value = PyUnicode_AsUTF8(val);
+	} else if (PyBool_Check(val)) {
+		if (val == Py_False)
+			value = "False";
+		else
+			value = "True";
+	} else {
+		fatal("invalid object, config expects integer, bool or string");
+	}
+
+	name = PyUnicode_AsUTF8(attr);
+	v = kore_strdup(value);
+
+	if (!kore_configure_setting(name, v)) {
+		ret = -1;
+		PyErr_SetString(PyExc_RuntimeError,
+		    "configured cannot be changed at runtime");
+	} else {
+		ret = 0;
+	}
+
+	kore_free(v);
+
+	Py_XDECREF(repr);
+
+	return (ret);
 }
 
 static void
@@ -1004,9 +1888,7 @@ python_push_type(const char *name, PyObject *module, PyTypeObject *type)
 static void
 python_push_integer(PyObject *module, const char *name, long value)
 {
-	int		ret;
-
-	if ((ret = PyModule_AddIntConstant(module, name, value)) == -1)
+	if (PyModule_AddIntConstant(module, name, value) == -1)
 		fatal("python_push_integer: failed to add %s", name);
 }
 
@@ -1024,6 +1906,29 @@ python_kore_pgsql_register(PyObject *self, PyObject *args)
 	Py_RETURN_TRUE;
 }
 #endif
+
+static PyObject *
+python_kore_app(PyObject *self, PyObject *args)
+{
+	PyObject	*obj;
+
+	if (!PyArg_ParseTuple(args, "O", &obj)) {
+		PyErr_Clear();
+
+		if (kore_app == NULL)
+			Py_RETURN_NONE;
+
+		Py_INCREF(kore_app);
+		return (kore_app);
+	}
+
+	Py_XDECREF(kore_app);
+
+	kore_app = obj;
+	Py_INCREF(kore_app);
+
+	Py_RETURN_TRUE;
+}
 
 static PyObject *
 python_kore_log(PyObject *self, PyObject *args)
@@ -1050,41 +1955,166 @@ python_kore_time(PyObject *self, PyObject *args)
 }
 
 static PyObject *
-python_kore_bind(PyObject *self, PyObject *args)
+python_kore_server(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-	const char	*ip, *port;
+	struct kore_server	*srv;
+	const char		*name, *ip, *port, *path;
 
-	if (!PyArg_ParseTuple(args, "ss", &ip, &port))
-		return (NULL);
-
-	if (!kore_server_bind(ip, port, NULL)) {
-		PyErr_SetString(PyExc_RuntimeError, "failed to listen");
+	if (kwargs == NULL) {
+		PyErr_SetString(PyExc_RuntimeError, "missing keyword args");
 		return (NULL);
 	}
 
-	Py_RETURN_TRUE;
+	ip = python_string_from_dict(kwargs, "ip");
+	path = python_string_from_dict(kwargs, "path");
+
+	if (ip == NULL && path == NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "missing ip or path keywords");
+		return (NULL);
+	}
+
+	if (ip != NULL && path != NULL) {
+		PyErr_SetString(PyExc_RuntimeError, "ip/path are exclusive");
+		return (NULL);
+	}
+
+	name = python_string_from_dict(kwargs, "name");
+	if (name == NULL)
+		name = "default";
+
+	if ((srv = kore_server_lookup(name)) != NULL) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "server '%s' already exist", name);
+		return (NULL);
+	}
+
+	srv = kore_server_create(name);
+	python_bool_from_dict(kwargs, "tls", &srv->tls);
+
+	if (srv->tls && !kore_tls_supported()) {
+		kore_server_free(srv);
+		PyErr_SetString(PyExc_RuntimeError,
+		    "TLS not supported in this Kore build");
+		return (NULL);
+	}
+
+	if (ip != NULL) {
+		if ((port = python_string_from_dict(kwargs, "port")) == NULL) {
+			kore_server_free(srv);
+			PyErr_SetString(PyExc_RuntimeError,
+			    "missing or invalid 'port' keyword");
+			return (NULL);
+		}
+
+		if (!kore_server_bind(srv, ip, port, NULL)) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "failed to bind to '%s:%s'", ip, port);
+			return (NULL);
+		}
+	} else {
+		if (!kore_server_bind_unix(srv, path, NULL)) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "failed to bind to '%s'", path);
+			return (NULL);
+		}
+	}
+
+	kore_server_finalize(srv);
+
+	Py_RETURN_NONE;
 }
 
 static PyObject *
-python_kore_bind_unix(PyObject *self, PyObject *args)
+python_kore_privsep(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-	const char	*path;
+	struct kore_privsep	*ps;
+	const char		*val;
+	PyObject		*skip, *obj;
+	Py_ssize_t		list_len, idx;
 
-	if (!PyArg_ParseTuple(args, "s", &path))
+	if (!PyArg_ParseTuple(args, "s", &val))
 		return (NULL);
 
-	if (!kore_server_bind_unix(path, NULL)) {
-		PyErr_SetString(PyExc_RuntimeError, "failed bind to path");
+	if (!strcmp(val, "worker")) {
+		ps = &worker_privsep;
+	} else if (!strcmp(val, "keymgr")) {
+		ps = &keymgr_privsep;
+#if defined(KORE_USE_ACME)
+	} else if (!strcmp(val, "acme")) {
+		ps = &acme_privsep;
+#endif
+	} else {
+		PyErr_Format(PyExc_RuntimeError,
+		    "unknown privsep process '%s'", val);
 		return (NULL);
 	}
 
-	Py_RETURN_TRUE;
+	if ((val = python_string_from_dict(kwargs, "root")) != NULL) {
+		kore_free(ps->root);
+		ps->root = kore_strdup(val);
+	}
+
+	if ((val = python_string_from_dict(kwargs, "runas")) != NULL) {
+		kore_free(ps->runas);
+		ps->runas = kore_strdup(val);
+	}
+
+	if ((skip = PyDict_GetItemString(kwargs, "skip")) != NULL) {
+		if (!PyList_CheckExact(skip)) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "privsep skip keyword needs to be a list");
+			return (NULL);
+		}
+
+		list_len = PyList_Size(skip);
+
+		for (idx = 0; idx < list_len; idx++) {
+			if ((obj = PyList_GetItem(skip, idx)) == NULL)
+				return (NULL);
+
+			if (!PyUnicode_Check(obj))
+				return (NULL);
+
+			if ((val = PyUnicode_AsUTF8AndSize(obj, NULL)) == NULL)
+				return (NULL);
+
+			if (!strcmp(val, "chroot")) {
+				ps->skip_chroot = 1;
+			} else {
+				PyErr_Format(PyExc_RuntimeError,
+				    "unknown skip keyword '%s'", val);
+				return (NULL);
+			}
+		}
+	}
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+python_kore_prerequest(PyObject *self, PyObject *args)
+{
+	PyObject		*f;
+	struct reqcall		*rq;
+
+	if (!PyArg_ParseTuple(args, "O", &f))
+		return (NULL);
+
+	rq = kore_calloc(1, sizeof(*rq));
+	rq->f = f;
+
+	Py_INCREF(f);
+	TAILQ_INSERT_TAIL(&prereq, rq, list);
+
+	return (f);
 }
 
 static PyObject *
 python_kore_task_create(PyObject *self, PyObject *args)
 {
 	PyObject		*obj;
+	struct python_coro	*coro;
 
 	if (!PyArg_ParseTuple(args, "O", &obj))
 		return (NULL);
@@ -1092,10 +2122,61 @@ python_kore_task_create(PyObject *self, PyObject *args)
 	if (!PyCoro_CheckExact(obj))
 		fatal("%s: object is not a coroutine", __func__);
 
-	python_coro_create(obj, NULL);
+	coro = python_coro_create(obj, NULL);
 	Py_INCREF(obj);
 
-	Py_RETURN_NONE;
+	return (PyLong_FromUnsignedLongLong(coro->id));
+}
+
+static PyObject *
+python_kore_task_id(PyObject *self, PyObject *args)
+{
+	if (coro_running == NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "no coroutine active");
+		return (NULL);
+	}
+
+	return (PyLong_FromUnsignedLongLong(coro_running->id));
+}
+
+static PyObject *
+python_kore_task_kill(PyObject *self, PyObject *args)
+{
+	u_int64_t		id;
+	struct python_coro	*coro, *active;
+
+	if (!PyArg_ParseTuple(args, "K", &id))
+		return (NULL);
+
+	if (coro_running != NULL && coro_running->id == id) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "refusing to kill active coroutine");
+		return (NULL);
+	}
+
+	/* Remember active coro, as delete sets coro_running to NULL. */
+	active = coro_running;
+
+	TAILQ_FOREACH(coro, &coro_runnable, list) {
+		if (coro->id == id) {
+			coro->killed++;
+			kore_python_coro_delete(coro);
+			coro_running = active;
+			Py_RETURN_TRUE;
+		}
+	}
+
+	TAILQ_FOREACH(coro, &coro_suspended, list) {
+		if (coro->id == id) {
+			coro->killed++;
+			kore_python_coro_delete(coro);
+			coro_running = active;
+			Py_RETURN_TRUE;
+		}
+	}
+
+	Py_RETURN_FALSE;
 }
 
 static PyObject *
@@ -1167,6 +2248,16 @@ python_kore_queue(PyObject *self, PyObject *args)
 }
 
 static PyObject *
+python_kore_worker(PyObject *self, PyObject *args)
+{
+	if (worker == NULL) {
+		Py_RETURN_NONE;
+	}
+
+	return (PyLong_FromLong(worker->id));
+}
+
+static PyObject *
 python_kore_tracer(PyObject *self, PyObject *args)
 {
 	PyObject		*obj;
@@ -1189,6 +2280,154 @@ python_kore_tracer(PyObject *self, PyObject *args)
 	python_tracer = obj;
 
 	Py_RETURN_TRUE;
+}
+
+static PyObject *
+python_kore_domain(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+#if defined(KORE_USE_ACME)
+	int			acme;
+	char			*acert, *akey;
+#endif
+	struct kore_server	*srv;
+	long			depth;
+	const char		*name;
+	struct pydomain		*domain;
+	const char		*cert, *key, *ca, *attach, *crl;
+
+	ca = NULL;
+	depth = -1;
+	key = NULL;
+	crl = NULL;
+	cert = NULL;
+	attach = NULL;
+
+#if defined(KORE_USE_ACME)
+	acme = 0;
+#endif
+
+	if (!PyArg_ParseTuple(args, "s", &name))
+		return (NULL);
+
+	if (kwargs != NULL)
+		attach = python_string_from_dict(kwargs, "attach");
+
+	if (attach == NULL)
+		attach = "default";
+
+	if ((srv = kore_server_lookup(attach)) == NULL) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "server '%s' does not exist", attach);
+		return (NULL);
+	}
+
+	if (srv->tls) {
+		if (kwargs == NULL) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "no keywords for TLS enabled domain %s", name);
+			return (NULL);
+		}
+		key = python_string_from_dict(kwargs, "key");
+		cert = python_string_from_dict(kwargs, "cert");
+
+#if defined(KORE_USE_ACME)
+		python_bool_from_dict(kwargs, "acme", &acme);
+
+		if (acme) {
+			kore_acme_get_paths(name, &akey, &acert);
+			acme_domains++;
+			key = akey;
+			cert = acert;
+		}
+#endif
+
+		if (key == NULL || cert == NULL) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "missing key or cert keywords for TLS listener");
+			return (NULL);
+		}
+
+		ca = python_string_from_dict(kwargs, "client_verify");
+		if (ca != NULL) {
+			python_long_from_dict(kwargs, "verify_depth", &depth);
+			if (depth < 0) {
+				PyErr_Format(PyExc_RuntimeError,
+				    "invalid depth '%d'", depth);
+				return (NULL);
+			}
+			crl = python_string_from_dict(kwargs, "crl");
+		}
+	} else if (key != NULL || cert != NULL || ca != NULL) {
+		kore_log(LOG_INFO, "ignoring tls settings for '%s'", name);
+	}
+
+	if (kore_domain_lookup(srv, name) != NULL) {
+		PyErr_SetString(PyExc_RuntimeError, "domain exists");
+		return (NULL);
+	}
+
+	if ((domain = PyObject_New(struct pydomain, &pydomain_type)) == NULL)
+		return (NULL);
+
+	domain->next = NULL;
+	domain->kwargs = NULL;
+
+	if ((domain->config = kore_domain_new(name)) == NULL)
+		fatal("failed to create new domain configuration");
+
+	if (!kore_domain_attach(domain->config, srv))
+		fatal("failed to attach domain configuration");
+
+	if (srv->tls) {
+		domain->config->certkey = kore_strdup(key);
+		domain->config->certfile = kore_strdup(cert);
+
+#if defined(KORE_USE_ACME)
+		domain->config->acme = acme;
+
+		if (domain->config->acme) {
+			kore_free(akey);
+			kore_free(acert);
+		}
+#endif
+		if (ca != NULL) {
+			domain->config->cafile = kore_strdup(ca);
+			domain->config->x509_verify_depth = depth;
+			if (crl != NULL)
+				domain->config->crlfile = kore_strdup(crl);
+		}
+	}
+
+	return ((PyObject *)domain);
+}
+
+static PyObject *
+python_kore_route(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+	const char		*path;
+	PyObject		*inner;
+	struct pyroute		*route;
+
+	if ((route = PyObject_New(struct pyroute, &pyroute_type)) == NULL)
+		return (NULL);
+
+	if (!PyArg_ParseTuple(args, "s", &path))
+		return (NULL);
+
+	route->domain = NULL;
+	route->kwargs = kwargs;
+	route->path = kore_strdup(path);
+
+	Py_XINCREF(route->kwargs);
+
+	inner = PyObject_GetAttrString((PyObject *)route, "inner");
+	if (inner == NULL) {
+		Py_DECREF((PyObject *)route);
+		PyErr_SetString(PyExc_RuntimeError, "failed to find inner");
+		return (NULL);
+	}
+
+	return (inner);
 }
 
 static PyObject *
@@ -1315,6 +2554,112 @@ python_kore_fatalx(PyObject *self, PyObject *args)
 }
 
 static PyObject *
+python_kore_setname(PyObject *self, PyObject *args)
+{
+	const char	*name;
+	extern char	*kore_progname;
+
+	if (!PyArg_ParseTuple(args, "s", &name))
+		return (NULL);
+
+	kore_free(kore_progname);
+	kore_progname = kore_strdup(name);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+python_kore_sigtrap(PyObject *self, PyObject *args)
+{
+	int		sig;
+
+	if (!PyArg_ParseTuple(args, "i", &sig))
+		return (NULL);
+
+	kore_signal_trap(sig);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+python_kore_sendobj(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+	long		val;
+	u_int16_t	dst;
+	char		*ptr;
+	Py_ssize_t	length;
+	PyObject	*object, *bytes;
+
+	if (!PyArg_ParseTuple(args, "O", &object))
+		return (NULL);
+
+	bytes = PyObject_CallFunctionObjArgs(pickle_dumps, object, NULL);
+	if (bytes == NULL)
+		return (NULL);
+
+	if (PyBytes_AsStringAndSize(bytes, &ptr, &length) == -1) {
+		Py_DECREF(bytes);
+		return (NULL);
+	}
+
+	dst = KORE_MSG_WORKER_ALL;
+
+	if (kwargs != NULL) {
+		if (python_long_from_dict(kwargs, "worker", &val)) {
+			if (val <= 0 || val > worker_count ||
+			    val >= KORE_WORKER_MAX) {
+				PyErr_Format(PyExc_RuntimeError,
+				    "worker %ld invalid", val);
+				Py_DECREF(bytes);
+				return (NULL);
+			}
+
+			dst = val;
+		}
+	}
+
+	kore_msg_send(dst, KORE_PYTHON_SEND_OBJ, ptr, length);
+	Py_DECREF(bytes);
+
+	Py_RETURN_NONE;
+}
+
+static void
+python_kore_recvobj(struct kore_msg *msg, const void *data)
+{
+	struct kore_runtime	*rt;
+	PyObject		*onmsg, *ret, *bytes, *obj;
+
+	if ((onmsg = kore_module_getsym("koreapp.onmsg", &rt)) == NULL)
+		return;
+
+	if (rt->type != KORE_RUNTIME_PYTHON)
+		return;
+
+	if ((bytes = PyBytes_FromStringAndSize(data, msg->length)) == NULL) {
+		Py_DECREF(onmsg);
+		kore_python_log_error("koreapp.onmsg");
+		return;
+	}
+
+	obj = PyObject_CallFunctionObjArgs(pickle_loads, bytes, NULL);
+	Py_DECREF(bytes);
+
+	if (obj == NULL) {
+		Py_DECREF(onmsg);
+		kore_python_log_error("koreapp.onmsg");
+		return;
+	}
+
+	ret = PyObject_CallFunctionObjArgs(onmsg, obj, NULL);
+	kore_python_log_error("koreapp.onmsg");
+
+	Py_DECREF(obj);
+	Py_DECREF(onmsg);
+	Py_XDECREF(ret);
+}
+
+static PyObject *
 python_kore_suspend(PyObject *self, PyObject *args)
 {
 	struct pysuspend_op	*op;
@@ -1344,12 +2689,47 @@ python_kore_shutdown(PyObject *self, PyObject *args)
 }
 
 static PyObject *
-python_kore_timer(PyObject *self, PyObject *args)
+python_kore_coroname(PyObject *self, PyObject *args)
+{
+	const char		*name;
+
+	if (coro_running == NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "kore.coroname() only available in coroutines");
+		return (NULL);
+	}
+
+	if (!PyArg_ParseTuple(args, "s", &name))
+		return (NULL);
+
+	kore_free(coro_running->name);
+	coro_running->name = kore_strdup(name);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+python_kore_corotrace(PyObject *self, PyObject *args)
+{
+	if (!PyArg_ParseTuple(args, "b", &coro_tracing))
+		return (NULL);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+python_kore_timer(PyObject *self, PyObject *args, PyObject *kwargs)
 {
 	u_int64_t		ms;
 	PyObject		*obj;
 	int			flags;
 	struct pytimer		*timer;
+
+	if (worker == NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "kore.timer not supported on parent process");
+		return (NULL);
+	}
 
 	if (!PyArg_ParseTuple(args, "OKi", &obj, &ms, &flags))
 		return (NULL);
@@ -1362,6 +2742,7 @@ python_kore_timer(PyObject *self, PyObject *args)
 	if ((timer = PyObject_New(struct pytimer, &pytimer_type)) == NULL)
 		return (NULL);
 
+	timer->udata = NULL;
 	timer->flags = flags;
 	timer->callable = obj;
 	timer->run = kore_timer_add(pytimer_run, ms, timer, flags);
@@ -1369,16 +2750,26 @@ python_kore_timer(PyObject *self, PyObject *args)
 	Py_INCREF((PyObject *)timer);
 	Py_INCREF(timer->callable);
 
+	if (kwargs != NULL) {
+		if ((obj = PyDict_GetItemString(kwargs, "data")) != NULL) {
+			Py_INCREF(obj);
+			timer->udata = obj;
+		}
+	}
+
 	return ((PyObject *)timer);
 }
 
 static PyObject *
-python_kore_proc(PyObject *self, PyObject *args)
+python_kore_proc(PyObject *self, PyObject *args, PyObject *kwargs)
 {
+	union deconst		cp;
 	const char		*cmd;
 	struct pyproc		*proc;
-	char			*copy, *argv[32];
+	Py_ssize_t		idx, len;
+	PyObject		*obj, *item;
 	int			timeo, in_pipe[2], out_pipe[2];
+	char			*copy, *argv[32], *env[PYTHON_PROC_MAX_ENV + 1];
 
 	timeo = -1;
 
@@ -1390,6 +2781,37 @@ python_kore_proc(PyObject *self, PyObject *args)
 
 	if (!PyArg_ParseTuple(args, "s|i", &cmd, &timeo))
 		return (NULL);
+
+	if (kwargs != NULL &&
+	    (obj = PyDict_GetItemString(kwargs, "env")) != NULL) {
+		if (!PyList_CheckExact(obj)) {
+			PyErr_SetString(PyExc_RuntimeError,
+			    "kore.proc: env is not of type 'list'");
+			return (NULL);
+		}
+
+		len = PyList_Size(obj);
+		if (len > PYTHON_PROC_MAX_ENV) {
+			PyErr_SetString(PyExc_RuntimeError,
+			    "kore.proc: too many entries in 'env' keyword");
+			return (NULL);
+		}
+
+		for (idx = 0; idx < len; idx++) {
+			if ((item = PyList_GetItem(obj, idx)) == NULL)
+				return (NULL);
+
+			if (!PyUnicode_CheckExact(item))
+				return (NULL);
+
+			if ((cp.cp = PyUnicode_AsUTF8(item)) == NULL)
+				return (NULL);
+
+			env[idx] = cp.p;
+		}
+
+		env[idx] = NULL;
+	}
 
 	if (pipe(in_pipe) == -1) {
 		PyErr_SetString(PyExc_RuntimeError, errno_s);
@@ -1412,6 +2834,8 @@ python_kore_proc(PyObject *self, PyObject *args)
 	}
 
 	proc->pid = -1;
+	proc->op = NULL;
+	proc->apid = -1;
 	proc->reaped = 0;
 	proc->status = 0;
 	proc->timer = NULL;
@@ -1447,7 +2871,8 @@ python_kore_proc(PyObject *self, PyObject *args)
 
 		copy = kore_strdup(cmd);
 		python_split_arguments(copy, argv, 32);
-		(void)execve(argv[0], argv, NULL);
+
+		(void)execve(argv[0], argv, env);
 		kore_log(LOG_ERR, "kore.proc failed to execute %s (%s)",
 		    argv[0], errno_s);
 		exit(1);
@@ -1460,6 +2885,7 @@ python_kore_proc(PyObject *self, PyObject *args)
 	    !kore_connection_nonblock(out_pipe[0], 0))
 		fatal("failed to mark kore.proc pipes are non-blocking");
 
+	proc->apid = proc->pid;
 	proc->in->fd = in_pipe[1];
 	proc->out->fd = out_pipe[0];
 
@@ -1485,11 +2911,18 @@ python_import(const char *path)
 		fatal("python_import: '%s' is not a file or directory", path);
 
 	copy = kore_strdup(path);
-
-	if ((file = basename(copy)) == NULL)
-		fatal("basename: %s: %s", path, errno_s);
-	if ((dir = dirname(copy)) == NULL)
+	if ((p = dirname(copy)) == NULL)
 		fatal("dirname: %s: %s", path, errno_s);
+
+	dir = kore_strdup(p);
+	kore_free(copy);
+
+	copy = kore_strdup(path);
+	if ((p = basename(copy)) == NULL)
+		fatal("basename: %s: %s", path, errno_s);
+
+	file = kore_strdup(p);
+	kore_free(copy);
 
 	if ((p = strrchr(file, '.')) != NULL)
 		*p = '\0';
@@ -1503,7 +2936,8 @@ python_import(const char *path)
 	if (module == NULL)
 		PyErr_Print();
 
-	kore_free(copy);
+	kore_free(dir);
+	kore_free(file);
 
 	return (module);
 }
@@ -1542,6 +2976,7 @@ out:
 	if (obj != NULL)
 		Py_DECREF(obj);
 
+	PyErr_Clear();
 	kore_free(base);
 
 	return (res);
@@ -1610,29 +3045,20 @@ pyconnection_get_addr(struct pyconnection *pyc, void *closure)
 	return (result);
 }
 
-#if !defined(KORE_NO_TLS)
 static PyObject *
 pyconnection_get_peer_x509(struct pyconnection *pyc, void *closure)
 {
-	int			len;
-	PyObject		*bytes;
-	u_int8_t		*der, *pp;
+	size_t		len;
+	u_int8_t	*der;
+	PyObject	*bytes;
 
-	if (pyc->c->cert == NULL) {
+	if (pyc->c->tls_cert == NULL) {
 		Py_RETURN_NONE;
 	}
 
-	if ((len = i2d_X509(pyc->c->cert, NULL)) <= 0) {
-		PyErr_SetString(PyExc_RuntimeError, "i2d_X509 failed");
-		return (NULL);
-	}
-
-	der = kore_calloc(1, len);
-	pp = der;
-
-	if (i2d_X509(pyc->c->cert, &pp) <= 0) {
-		kore_free(der);
-		PyErr_SetString(PyExc_RuntimeError, "i2d_X509 failed");
+	if (!kore_tls_x509_data(pyc->c, &der, &len)) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "failed to obtain certificate data");
 		return (NULL);
 	}
 
@@ -1641,7 +3067,97 @@ pyconnection_get_peer_x509(struct pyconnection *pyc, void *closure)
 
 	return (bytes);
 }
-#endif
+
+static PyObject *
+pyconnection_get_peer_x509dict(struct pyconnection *pyc, void *closure)
+{
+	KORE_X509_NAMES	*name;
+	PyObject	*dict, *issuer, *subject, *ret;
+
+	ret = NULL;
+	issuer = NULL;
+	subject = NULL;
+
+	if (pyc->c->tls_cert == NULL) {
+		Py_RETURN_NONE;
+	}
+
+	if ((dict = PyDict_New()) == NULL)
+		goto out;
+
+	if ((issuer = PyDict_New()) == NULL)
+		goto out;
+
+	if (PyDict_SetItemString(dict, "issuer", issuer) == -1)
+		goto out;
+
+	if ((subject = PyDict_New()) == NULL)
+		goto out;
+
+	if (PyDict_SetItemString(dict, "subject", subject) == -1)
+		goto out;
+
+	PyErr_Clear();
+
+	if ((name = kore_tls_x509_subject_name(pyc->c)) == NULL) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "failed to obtain x509 subjectName");
+		goto out;
+	}
+
+	if (!kore_tls_x509name_foreach(name, 0, subject,
+	    pyconnection_x509_cb)) {
+		if (PyErr_Occurred() == NULL) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "failed to add subject name to dictionary");
+		}
+		goto out;
+	}
+
+	if ((name = kore_tls_x509_issuer_name(pyc->c)) == NULL) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "failed to obtain x509 issuerName");
+		goto out;
+	}
+
+	if (!kore_tls_x509name_foreach(name, 0, issuer, pyconnection_x509_cb)) {
+		if (PyErr_Occurred() == NULL) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "failed to add issuer name to dictionary");
+		}
+		goto out;
+	}
+
+	ret = dict;
+	dict = NULL;
+
+out:
+	Py_XDECREF(dict);
+	Py_XDECREF(issuer);
+	Py_XDECREF(subject);
+
+	return (ret);
+}
+
+static int
+pyconnection_x509_cb(void *udata, int islast, int nid, const char *field,
+    const void *data, size_t len, int flags)
+{
+	PyObject	*dict, *obj;
+
+	dict = udata;
+
+	if ((obj = PyUnicode_FromStringAndSize(data, len)) == NULL)
+		return (KORE_RESULT_ERROR);
+
+	if (PyDict_SetItemString(dict, field, obj) == -1) {
+		Py_DECREF(obj);
+		return (KORE_RESULT_ERROR);
+	}
+
+	Py_DECREF(obj);
+	return (KORE_RESULT_OK);
+}
 
 static void
 pytimer_run(void *arg, u_int64_t now)
@@ -1650,8 +3166,12 @@ pytimer_run(void *arg, u_int64_t now)
 	struct pytimer	*timer = arg;
 
 	PyErr_Clear();
-	ret = PyObject_CallObject(timer->callable, NULL);
+	ret = PyObject_CallFunctionObjArgs(timer->callable, timer->udata, NULL);
 	Py_XDECREF(ret);
+	Py_XDECREF(timer->udata);
+
+	timer->udata = NULL;
+	kore_python_log_error("pytimer_run");
 
 	if (timer->flags & KORE_TIMER_ONESHOT) {
 		timer->run = NULL;
@@ -1686,6 +3206,11 @@ pytimer_close(struct pytimer *timer, PyObject *args)
 	if (timer->callable != NULL) {
 		Py_DECREF(timer->callable);
 		timer->callable = NULL;
+	}
+
+	if (timer->udata != NULL) {
+		Py_DECREF(timer->udata);
+		timer->udata = NULL;
 	}
 
 	Py_INCREF((PyObject *)timer);
@@ -1793,11 +3318,15 @@ static PyObject *
 pysocket_send(struct pysocket *sock, PyObject *args)
 {
 	Py_buffer	buf;
+	PyObject	*ret;
 
 	if (!PyArg_ParseTuple(args, "y*", &buf))
 		return (NULL);
 
-	return (pysocket_op_create(sock, PYSOCKET_TYPE_SEND, buf.buf, buf.len));
+	ret = pysocket_op_create(sock, PYSOCKET_TYPE_SEND, buf.buf, buf.len);
+	PyBuffer_Release(&buf);
+
+	return (ret);
 }
 
 static PyObject *
@@ -1828,6 +3357,7 @@ pysocket_sendto(struct pysocket *sock, PyObject *args)
 	}
 
 	ret = pysocket_op_create(sock, PYSOCKET_TYPE_SENDTO, buf.buf, buf.len);
+	PyBuffer_Release(&buf);
 
 	op = (struct pysocket_op *)ret;
 
@@ -1882,6 +3412,17 @@ pysocket_recv(struct pysocket *sock, PyObject *args)
 	}
 
 	return (obj);
+}
+
+static PyObject *
+pysocket_recvmsg(struct pysocket *sock, PyObject *args)
+{
+	Py_ssize_t	len;
+
+	if (!PyArg_ParseTuple(args, "n", &len))
+		return (NULL);
+
+	return (pysocket_op_create(sock, PYSOCKET_TYPE_RECVMSG, NULL, len));
 }
 
 static PyObject *
@@ -1970,6 +3511,7 @@ pysocket_close(struct pysocket *sock, PyObject *args)
 	}
 
 	sock->fd = -1;
+	sock->event.evt.handle(&sock->event, 1);
 
 	Py_RETURN_TRUE;
 }
@@ -1978,13 +3520,16 @@ static void
 pysocket_op_dealloc(struct pysocket_op *op)
 {
 	if (op->type == PYSOCKET_TYPE_RECV ||
+	    op->type == PYSOCKET_TYPE_RECVMSG ||
 	    op->type == PYSOCKET_TYPE_RECVFROM ||
-	    op->type == PYSOCKET_TYPE_SEND)
+	    op->type == PYSOCKET_TYPE_SEND ||
+	    op->type == PYSOCKET_TYPE_SENDTO)
 		kore_buf_cleanup(&op->buffer);
 
 	switch (op->type) {
 	case PYSOCKET_TYPE_RECV:
 	case PYSOCKET_TYPE_ACCEPT:
+	case PYSOCKET_TYPE_RECVMSG:
 	case PYSOCKET_TYPE_RECVFROM:
 		if (op->socket->recvop != op)
 			fatal("recvop mismatch");
@@ -2021,6 +3566,7 @@ pysocket_op_create(struct pysocket *sock, int type, const void *ptr, size_t len)
 	switch (type) {
 	case PYSOCKET_TYPE_RECV:
 	case PYSOCKET_TYPE_ACCEPT:
+	case PYSOCKET_TYPE_RECVMSG:
 	case PYSOCKET_TYPE_RECVFROM:
 		if (sock->recvop != NULL) {
 			PyErr_SetString(PyExc_RuntimeError,
@@ -2057,6 +3603,7 @@ pysocket_op_create(struct pysocket *sock, int type, const void *ptr, size_t len)
 
 	switch (type) {
 	case PYSOCKET_TYPE_RECV:
+	case PYSOCKET_TYPE_RECVMSG:
 	case PYSOCKET_TYPE_RECVFROM:
 		sock->recvop = op;
 		kore_buf_init(&op->buffer, len);
@@ -2129,6 +3676,7 @@ pysocket_op_iternext(struct pysocket_op *op)
 		ret = pysocket_async_accept(op);
 		break;
 	case PYSOCKET_TYPE_RECV:
+	case PYSOCKET_TYPE_RECVMSG:
 	case PYSOCKET_TYPE_RECVFROM:
 		ret = pysocket_async_recv(op);
 		break;
@@ -2227,23 +3775,46 @@ pysocket_async_accept(struct pysocket_op *op)
 static PyObject *
 pysocket_async_recv(struct pysocket_op *op)
 {
-	ssize_t		ret;
-	size_t		len;
-	u_int16_t	port;
-	socklen_t	socklen;
-	struct sockaddr *sendaddr;
-	const char	*ptr, *ip;
-	PyObject	*bytes, *result, *tuple;
+	ssize_t			ret;
+	size_t			len;
+	u_int16_t		port;
+	struct iovec		iov;
+	struct msghdr		msg;
+	socklen_t		socklen;
+	struct sockaddr 	*sendaddr;
+	const char		*ptr, *ip;
+	u_int8_t		ancdata[1024];
+	PyObject		*bytes, *result, *tuple, *list;
 
 	if (!(op->socket->event.evt.flags & KORE_EVENT_READ)) {
 		Py_RETURN_NONE;
 	}
 
+	socklen = 0;
+
 	for (;;) {
-		if (op->type == PYSOCKET_TYPE_RECV) {
+		switch (op->type) {
+		case PYSOCKET_TYPE_RECV:
 			ret = read(op->socket->fd, op->buffer.data,
 			    op->buffer.length);
-		} else {
+			break;
+		case PYSOCKET_TYPE_RECVMSG:
+			memset(&msg, 0, sizeof(msg));
+
+			iov.iov_base = op->buffer.data;
+			iov.iov_len = op->buffer.length;
+
+			msg.msg_iov = &iov;
+			msg.msg_iovlen = 1;
+			msg.msg_name = &op->sendaddr;
+			msg.msg_namelen = sizeof(op->sendaddr);
+			msg.msg_control = ancdata;
+			msg.msg_controllen = sizeof(ancdata);
+
+			memset(&op->sendaddr, 0, sizeof(op->sendaddr));
+			ret = recvmsg(op->socket->fd, &msg, 0);
+			break;
+		case PYSOCKET_TYPE_RECVFROM:
 			sendaddr = (struct sockaddr *)&op->sendaddr;
 			switch (op->socket->family) {
 			case AF_INET:
@@ -2253,12 +3824,15 @@ pysocket_async_recv(struct pysocket_op *op)
 				socklen = sizeof(op->sendaddr.sun);
 				break;
 			default:
-				fatal("non AF_INET/AF_UNIX in %s", __func__);
+				fatal("%s: non AF_INET/AF_UNIX", __func__);
 			}
 
 			memset(sendaddr, 0, socklen);
 			ret = recvfrom(op->socket->fd, op->buffer.data,
 			    op->buffer.length, 0, sendaddr, &socklen);
+			break;
+		default:
+			fatal("%s: unknown type %d", __func__, op->type);
 		}
 
 		if (ret == -1) {
@@ -2292,10 +3866,24 @@ pysocket_async_recv(struct pysocket_op *op)
 	if ((bytes = PyBytes_FromStringAndSize(ptr, ret)) == NULL)
 		return (NULL);
 
-	if (op->type == PYSOCKET_TYPE_RECV) {
+	list = NULL;
+
+	switch (op->type) {
+	case PYSOCKET_TYPE_RECV:
 		PyErr_SetObject(PyExc_StopIteration, bytes);
 		Py_DECREF(bytes);
 		return (NULL);
+	case PYSOCKET_TYPE_RECVMSG:
+		socklen = msg.msg_namelen;
+		if ((list = python_cmsg_to_list(&msg)) == NULL) {
+			Py_DECREF(bytes);
+			return (NULL);
+		}
+		break;
+	case PYSOCKET_TYPE_RECVFROM:
+		break;
+	default:
+		fatal("%s: unknown type %d", __func__, op->type);
 	}
 
 	switch(op->socket->family) {
@@ -2303,8 +3891,10 @@ pysocket_async_recv(struct pysocket_op *op)
 		port = ntohs(op->sendaddr.ipv4.sin_port);
 		ip = inet_ntoa(op->sendaddr.ipv4.sin_addr);
 
-		if ((tuple = Py_BuildValue("(sHN)", ip, port, bytes)) == NULL)
-			return (NULL);
+		if (op->type == PYSOCKET_TYPE_RECVFROM)
+			tuple = Py_BuildValue("(sHN)", ip, port, bytes);
+		else
+			tuple = Py_BuildValue("(sHNN)", ip, port, bytes, list);
 		break;
 	case AF_UNIX:
 		len = strlen(op->sendaddr.sun.sun_path);
@@ -2316,18 +3906,29 @@ pysocket_async_recv(struct pysocket_op *op)
 		}
 #endif
 		if (len == 0) {
-			if ((tuple = Py_BuildValue("(ON)",
-			    Py_None, bytes)) == NULL)
-				return (NULL);
-			break;
+			if (op->type == PYSOCKET_TYPE_RECVFROM) {
+				tuple = Py_BuildValue("(ON)", Py_None, bytes);
+			} else {
+				tuple = Py_BuildValue("(ONN)",
+				    Py_None, bytes, list);
+			}
+		} else {
+			if (op->type == PYSOCKET_TYPE_RECVFROM) {
+				tuple = Py_BuildValue("(sN)",
+				    op->sendaddr.sun.sun_path, bytes);
+			} else {
+				tuple = Py_BuildValue("(sNN)",
+				    op->sendaddr.sun.sun_path, bytes, list);
+			}
 		}
-
-		if ((tuple = Py_BuildValue("(sN)",
-		    op->sendaddr.sun.sun_path, bytes)) == NULL)
-			return (NULL);
 		break;
 	default:
-		PyErr_SetString(PyExc_RuntimeError, "Unsupported family");
+		fatal("%s: non AF_INET/AF_UNIX", __func__);
+	}
+
+	if (tuple == NULL) {
+		Py_XDECREF(list);
+		Py_DECREF(bytes);
 		return (NULL);
 	}
 
@@ -2337,6 +3938,7 @@ pysocket_async_recv(struct pysocket_op *op)
 		return (NULL);
 	}
 
+	Py_DECREF(tuple);
 	PyErr_SetObject(PyExc_StopIteration, result);
 	Py_DECREF(result);
 
@@ -2588,6 +4190,7 @@ pylock_dealloc(struct pylock *lock)
 	while ((op = TAILQ_FIRST(&lock->ops)) != NULL) {
 		TAILQ_REMOVE(&lock->ops, op, list);
 		op->active = 0;
+		op->coro->lockop = NULL;
 		Py_DECREF((PyObject *)op);
 	}
 
@@ -2595,9 +4198,43 @@ pylock_dealloc(struct pylock *lock)
 }
 
 static PyObject *
+pylock_trylock(struct pylock *lock, PyObject *args)
+{
+	if (lock->owner != NULL)
+		Py_RETURN_FALSE;
+
+	lock->owner = coro_running;
+
+	Py_RETURN_TRUE;
+}
+
+static PyObject *
+pylock_release(struct pylock *lock, PyObject *args)
+{
+	if (lock->owner == NULL) {
+		PyErr_SetString(PyExc_RuntimeError, "no lock owner set");
+		return (NULL);
+	}
+
+	if (lock->owner->id != coro_running->id) {
+		PyErr_SetString(PyExc_RuntimeError, "lock not owned by caller");
+		return (NULL);
+	}
+
+	pylock_do_release(lock);
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
 pylock_aenter(struct pylock *lock, PyObject *args)
 {
 	struct pylock_op	*op;
+
+	if (coro_running->lockop != NULL) {
+		fatal("%s: lockop not NULL for %" PRIu64,
+		    __func__, coro_running->id);
+	}
 
 	if (lock->owner != NULL && lock->owner->id == coro_running->id) {
 		PyErr_SetString(PyExc_RuntimeError, "recursive lock detected");
@@ -2612,6 +4249,8 @@ pylock_aenter(struct pylock *lock, PyObject *args)
 	op->locking = 1;
 	op->coro = coro_running;
 
+	coro_running->lockop = op;
+
 	Py_INCREF((PyObject *)op);
 	Py_INCREF((PyObject *)lock);
 
@@ -2625,6 +4264,11 @@ pylock_aexit(struct pylock *lock, PyObject *args)
 {
 	struct pylock_op	*op;
 
+	if (coro_running->lockop != NULL) {
+		fatal("%s: lockop not NULL for %" PRIu64,
+		    __func__, coro_running->id);
+	}
+
 	if (lock->owner == NULL || lock->owner->id != coro_running->id) {
 		PyErr_SetString(PyExc_RuntimeError, "invalid lock owner");
 		return (NULL);
@@ -2637,6 +4281,8 @@ pylock_aexit(struct pylock *lock, PyObject *args)
 	op->lock = lock;
 	op->locking = 0;
 	op->coro = coro_running;
+
+	coro_running->lockop = op;
 
 	Py_INCREF((PyObject *)op);
 	Py_INCREF((PyObject *)lock);
@@ -2657,14 +4303,15 @@ pylock_do_release(struct pylock *lock)
 		if (op->locking == 0)
 			continue;
 
-		TAILQ_REMOVE(&op->lock->ops, op, list);
+		op->active = 0;
+		op->coro->lockop = NULL;
+		TAILQ_REMOVE(&lock->ops, op, list);
 
 		if (op->coro->request != NULL)
 			http_request_wakeup(op->coro->request);
 		else
 			python_coro_wakeup(op->coro);
 
-		op->active = 0;
 		Py_DECREF((PyObject *)op);
 		break;
 	}
@@ -2677,6 +4324,8 @@ pylock_op_dealloc(struct pylock_op *op)
 		TAILQ_REMOVE(&op->lock->ops, op, list);
 		op->active = 0;
 	}
+
+	op->coro->lockop = NULL;
 
 	Py_DECREF((PyObject *)op->lock);
 	PyObject_Del((PyObject *)op);
@@ -2708,14 +4357,29 @@ pylock_op_iternext(struct pylock_op *op)
 		pylock_do_release(op->lock);
 	} else {
 		if (op->lock->owner != NULL) {
+			/*
+			 * We could be beat by another coroutine that grabbed
+			 * the lock even if we were the one woken up for it.
+			 */
+			if (op->active == 0) {
+				op->active = 1;
+				op->coro->lockop = op;
+				TAILQ_INSERT_HEAD(&op->lock->ops, op, list);
+				Py_INCREF((PyObject *)op);
+			}
 			Py_RETURN_NONE;
 		}
 
 		op->lock->owner = coro_running;
 	}
 
-	op->active = 0;
-	TAILQ_REMOVE(&op->lock->ops, op, list);
+	if (op->active) {
+		op->active = 0;
+		op->coro->lockop = NULL;
+		TAILQ_REMOVE(&op->lock->ops, op, list);
+		Py_DECREF((PyObject *)op);
+	}
+
 	PyErr_SetNone(PyExc_StopIteration);
 
 	return (NULL);
@@ -2798,6 +4462,12 @@ pyproc_reap(struct pyproc *proc, PyObject *args)
 {
 	struct pyproc_op	*op;
 
+	if (proc->op != NULL) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "process %d already being reaped", proc->apid);
+		return (NULL);
+	}
+
 	if (proc->timer != NULL) {
 		kore_timer_remove(proc->timer);
 		proc->timer = NULL;
@@ -2807,6 +4477,9 @@ pyproc_reap(struct pyproc *proc, PyObject *args)
 		return (NULL);
 
 	op->proc = proc;
+	op->coro = coro_running;
+
+	proc->op = op;
 
 	Py_INCREF((PyObject *)proc);
 
@@ -2862,6 +4535,8 @@ pyproc_send(struct pyproc *proc, PyObject *args)
 	ret = pysocket_op_create(proc->in,
 	    PYSOCKET_TYPE_SEND, buf.buf, buf.len);
 
+	PyBuffer_Release(&buf);
+
 	return (ret);
 }
 
@@ -2874,6 +4549,12 @@ pyproc_close_stdin(struct pyproc *proc, PyObject *args)
 	}
 
 	Py_RETURN_TRUE;
+}
+
+static PyObject *
+pyproc_get_pid(struct pyproc *proc, void *closure)
+{
+	return (PyLong_FromLong(proc->apid));
 }
 
 static void
@@ -2931,6 +4612,9 @@ pygather_reap_coro(struct pygather_op *op, struct python_coro *reap)
 {
 	struct pygather_coro	*coro;
 	struct pygather_result	*result;
+#if PY_VERSION_HEX >= 0x030A0000
+	PyObject		*type, *traceback;
+#endif
 
 	TAILQ_FOREACH(coro, &op->coroutines, list) {
 		if (coro->coro->id == reap->id)
@@ -2947,10 +4631,27 @@ pygather_reap_coro(struct pygather_op *op, struct python_coro *reap)
 	result = kore_pool_get(&gather_result_pool);
 	result->obj = NULL;
 
+#if PY_VERSION_HEX < 0x030A0000
 	if (_PyGen_FetchStopIterationValue(&result->obj) == -1) {
 		result->obj = Py_None;
 		Py_INCREF(Py_None);
 	}
+#else
+	if (PyErr_Occurred()) {
+		Py_XDECREF(coro->coro->result);
+		PyErr_Fetch(&type, &coro->coro->result, &traceback);
+		Py_DECREF(type);
+		Py_XDECREF(traceback);
+	} else {
+		if (coro->coro->result == NULL) {
+			coro->coro->result = Py_None;
+			Py_INCREF(Py_None);
+		}
+	}
+
+	result->obj = coro->coro->result;
+	Py_INCREF(result->obj);
+#endif
 
 	TAILQ_INSERT_TAIL(&op->results, result, list);
 
@@ -3072,6 +4773,7 @@ pyhttp_request_alloc(const struct http_request *req)
 	ptr.cp = req;
 	pyreq->req = ptr.p;
 	pyreq->data = NULL;
+	pyreq->dict = NULL;
 
 	return ((PyObject *)pyreq);
 }
@@ -3090,31 +4792,107 @@ pyhttp_file_alloc(struct http_file *file)
 	return ((PyObject *)pyfile);
 }
 
+static int
+pyhttp_preprocess(struct http_request *req)
+{
+	struct reqcall		*rq;
+	PyObject		*ret;
+
+	rq = req->py_rqnext;
+
+	while (rq) {
+		req->py_rqnext = TAILQ_NEXT(rq, list);
+
+		PyErr_Clear();
+		ret = PyObject_CallFunctionObjArgs(rq->f, req->py_req, NULL);
+
+		if (ret == NULL) {
+			kore_python_log_error("preprocess");
+			http_response(req, HTTP_STATUS_INTERNAL_ERROR, NULL, 0);
+			return (KORE_RESULT_ERROR);
+		}
+
+		if (ret == Py_False) {
+			Py_DECREF(ret);
+			return (KORE_RESULT_ERROR);
+		}
+
+		if (PyCoro_CheckExact(ret)) {
+			req->py_coro = python_coro_create(ret, req);
+			if (python_coro_run(req->py_coro) == KORE_RESULT_OK) {
+				http_request_wakeup(req);
+				kore_python_coro_delete(req->py_coro);
+				req->py_coro = NULL;
+				rq = req->py_rqnext;
+				continue;
+			}
+			return (KORE_RESULT_RETRY);
+		}
+
+		Py_DECREF(ret);
+		rq = req->py_rqnext;
+	}
+
+	return (KORE_RESULT_OK);
+}
+
 static PyObject *
 pyhttp_response(struct pyhttp_request *pyreq, PyObject *args)
 {
+	struct connection	*c;
 	char			*ptr;
-	PyObject		*data;
 	Py_ssize_t		length;
 	int			status;
+	struct pyhttp_iterobj	*iterobj;
+	PyObject		*obj, *iterator;
 
 	length = -1;
 
-	if (!PyArg_ParseTuple(args, "iS", &status, &data))
+	if (!PyArg_ParseTuple(args, "iO", &status, &obj))
 		return (NULL);
 
-	if (PyBytes_AsStringAndSize(data, &ptr, &length) == -1)
-		return (NULL);
+	if (PyBytes_CheckExact(obj)) {
+		if (PyBytes_AsStringAndSize(obj, &ptr, &length) == -1)
+			return (NULL);
 
-	if (length < 0) {
-		PyErr_SetString(PyExc_TypeError, "invalid length");
-		return (NULL);
+		if (length < 0) {
+			PyErr_SetString(PyExc_TypeError, "invalid length");
+			return (NULL);
+		}
+
+		Py_INCREF(obj);
+
+		http_response_stream(pyreq->req, status, ptr, length,
+		    pyhttp_response_sent, obj);
+	} else if (obj == Py_None) {
+		http_response(pyreq->req, status, NULL, 0);
+	} else {
+		c = pyreq->req->owner;
+		if (c->state == CONN_STATE_DISCONNECTING) {
+			Py_RETURN_FALSE;
+		}
+
+		if ((iterator = PyObject_GetIter(obj)) == NULL)
+			return (NULL);
+
+		iterobj = kore_pool_get(&iterobj_pool);
+		iterobj->iterator = iterator;
+		iterobj->connection = c;
+		iterobj->remove = 0;
+
+		kore_buf_init(&iterobj->buf, 4096);
+
+		c->hdlr_extra = iterobj;
+		c->flags |= CONN_IS_BUSY;
+		c->disconnect = pyhttp_iterobj_disconnect;
+
+		pyreq->req->flags |= HTTP_REQUEST_NO_CONTENT_LENGTH;
+		http_response_header(pyreq->req, "transfer-encoding",
+		    "chunked");
+
+		http_response(pyreq->req, status, NULL, 0);
+		pyhttp_iterobj_next(iterobj);
 	}
-
-	Py_INCREF(data);
-
-	http_response_stream(pyreq->req, status, ptr, length,
-	    pyhttp_response_sent, data);
 
 	Py_RETURN_TRUE;
 }
@@ -3128,6 +4906,93 @@ pyhttp_response_sent(struct netbuf *nb)
 	Py_DECREF(data);
 
 	return (KORE_RESULT_OK);
+}
+
+static int
+pyhttp_iterobj_next(struct pyhttp_iterobj *iterobj)
+{
+	struct netbuf		*nb;
+	PyObject		*obj;
+	const char		*ptr;
+	Py_ssize_t		length;
+
+	PyErr_Clear();
+
+	if ((obj = PyIter_Next(iterobj->iterator)) == NULL) {
+		if (PyErr_Occurred()) {
+			kore_python_log_error("pyhttp_iterobj_next");
+			return (KORE_RESULT_ERROR);
+		}
+
+		return (KORE_RESULT_OK);
+	}
+
+	if ((ptr = PyUnicode_AsUTF8AndSize(obj, &length)) == NULL) {
+		kore_python_log_error("pyhttp_iterobj_next");
+		return (KORE_RESULT_ERROR);
+	}
+
+	kore_buf_reset(&iterobj->buf);
+	kore_buf_appendf(&iterobj->buf, "%lx\r\n", length);
+	kore_buf_append(&iterobj->buf, ptr, length);
+	kore_buf_appendf(&iterobj->buf, "\r\n");
+
+	Py_DECREF(obj);
+
+	net_send_stream(iterobj->connection, iterobj->buf.data,
+	    iterobj->buf.offset, pyhttp_iterobj_chunk_sent, &nb);
+
+	nb->extra = iterobj;
+
+	return (KORE_RESULT_RETRY);
+}
+
+static int
+pyhttp_iterobj_chunk_sent(struct netbuf *nb)
+{
+	int			ret;
+	struct pyhttp_iterobj	*iterobj;
+
+	iterobj = nb->extra;
+
+	if (iterobj->remove) {
+		ret = KORE_RESULT_ERROR;
+	} else {
+		ret = pyhttp_iterobj_next(iterobj);
+	}
+
+	if (ret != KORE_RESULT_RETRY) {
+		iterobj->connection->hdlr_extra = NULL;
+		iterobj->connection->disconnect = NULL;
+		iterobj->connection->flags &= ~CONN_IS_BUSY;
+
+		if (iterobj->remove == 0)
+			http_start_recv(iterobj->connection);
+
+		kore_buf_reset(&iterobj->buf);
+		kore_buf_appendf(&iterobj->buf, "0\r\n\r\n");
+		net_send_queue(iterobj->connection,
+		    iterobj->buf.data, iterobj->buf.offset);
+
+		Py_DECREF(iterobj->iterator);
+
+		kore_buf_cleanup(&iterobj->buf);
+		kore_pool_put(&iterobj_pool, iterobj);
+	} else {
+		ret = KORE_RESULT_OK;
+	}
+
+	return (ret);
+}
+
+static void
+pyhttp_iterobj_disconnect(struct connection *c)
+{
+	struct pyhttp_iterobj	*iterobj;
+
+	iterobj = c->hdlr_extra;
+	iterobj->remove = 1;
+	c->hdlr_extra = NULL;
 }
 
 static PyObject *
@@ -3187,12 +5052,7 @@ pyhttp_body_read(struct pyhttp_request *pyreq, PyObject *args)
 		return (NULL);
 	}
 
-	if (ret > INT_MAX) {
-		PyErr_SetString(PyExc_RuntimeError, "ret > INT_MAX");
-		return (NULL);
-	}
-
-	result = Py_BuildValue("ny#", ret, buf, (int)ret);
+	result = Py_BuildValue("ny#", ret, buf, ret);
 	if (result == NULL)
 		return (PyErr_NoMemory());
 
@@ -3262,9 +5122,49 @@ pyhttp_cookie(struct pyhttp_request *pyreq, PyObject *args)
 	}
 
 	if ((value = PyUnicode_FromString(string)) == NULL)
-		return (PyErr_NoMemory());
+		return (NULL);
 
 	return (value);
+}
+
+static PyObject *
+pyhttp_headers(struct pyhttp_request *pyreq, PyObject *args)
+{
+	struct http_header	*hdr;
+	struct http_request	*req;
+	PyObject		*obj, *dict, *ret;
+
+	ret = NULL;
+	obj = NULL;
+	dict = NULL;
+
+	req = pyreq->req;
+
+	if ((dict = PyDict_New()) == NULL)
+		goto cleanup;
+
+	if ((obj = PyUnicode_FromString(req->host)) == NULL)
+		goto cleanup;
+
+	if (PyDict_SetItemString(dict, "host", obj) == -1)
+		goto cleanup;
+
+	TAILQ_FOREACH(hdr, &req->req_headers, list) {
+		if ((obj = PyUnicode_FromString(hdr->value)) == NULL)
+			goto cleanup;
+		if (PyDict_SetItemString(dict, hdr->header, obj) == -1)
+			goto cleanup;
+	}
+
+	ret = dict;
+	obj = NULL;
+	dict = NULL;
+
+cleanup:
+	Py_XDECREF(obj);
+	Py_XDECREF(dict);
+
+	return (ret);
 }
 
 static PyObject *
@@ -3311,12 +5211,7 @@ pyhttp_file_read(struct pyhttp_file *pyfile, PyObject *args)
 		return (NULL);
 	}
 
-	if (ret > INT_MAX) {
-		PyErr_SetString(PyExc_RuntimeError, "ret > INT_MAX");
-		return (NULL);
-	}
-
-	result = Py_BuildValue("ny#", ret, buf, (int)ret);
+	result = Py_BuildValue("ny#", ret, buf, ret);
 	if (result == NULL)
 		return (PyErr_NoMemory());
 
@@ -3326,12 +5221,33 @@ pyhttp_file_read(struct pyhttp_file *pyfile, PyObject *args)
 static PyObject *
 pyhttp_websocket_handshake(struct pyhttp_request *pyreq, PyObject *args)
 {
-	const char	*onconnect, *onmsg, *ondisconnect;
+	struct connection	*c;
+	PyObject		*onconnect, *onmsg, *ondisconnect;
 
-	if (!PyArg_ParseTuple(args, "sss", &onconnect, &onmsg, &ondisconnect))
+	if (!PyArg_ParseTuple(args, "OOO", &onconnect, &onmsg, &ondisconnect))
 		return (NULL);
 
-	kore_websocket_handshake(pyreq->req, onconnect, onmsg, ondisconnect);
+	kore_websocket_handshake(pyreq->req, NULL, NULL, NULL);
+
+	c = pyreq->req->owner;
+
+	Py_INCREF(onconnect);
+	Py_INCREF(onmsg);
+	Py_INCREF(ondisconnect);
+
+	c->ws_connect = kore_calloc(1, sizeof(struct kore_runtime_call));
+	c->ws_connect->addr = onconnect;
+	c->ws_connect->runtime = &kore_python_runtime;
+
+	c->ws_message = kore_calloc(1, sizeof(struct kore_runtime_call));
+	c->ws_message->addr = onmsg;
+	c->ws_message->runtime = &kore_python_runtime;
+
+	c->ws_disconnect = kore_calloc(1, sizeof(struct kore_runtime_call));
+	c->ws_disconnect->addr = ondisconnect;
+	c->ws_disconnect->runtime = &kore_python_runtime;
+
+	python_runtime_connect(onconnect, c);
 
 	Py_RETURN_TRUE;
 }
@@ -3339,8 +5255,9 @@ pyhttp_websocket_handshake(struct pyhttp_request *pyreq, PyObject *args)
 static PyObject *
 pyconnection_websocket_send(struct pyconnection *pyc, PyObject *args)
 {
+	int		op;
+	ssize_t		len;
 	const char	*data;
-	int		op, len;
 
 	if (pyc->c->proto != CONN_PROTO_WEBSOCKET) {
 		PyErr_SetString(PyExc_TypeError, "not a websocket connection");
@@ -3375,10 +5292,11 @@ static PyObject *
 python_websocket_broadcast(PyObject *self, PyObject *args)
 {
 	struct connection	*c;
+	ssize_t			len;
 	struct pyconnection	*pyc;
 	const char		*data;
 	PyObject		*pysrc;
-	int			op, broadcast, len;
+	int			op, broadcast;
 
 	len = -1;
 
@@ -3478,42 +5396,50 @@ pyhttp_get_body(struct pyhttp_request *pyreq, void *closure)
 static PyObject *
 pyhttp_get_agent(struct pyhttp_request *pyreq, void *closure)
 {
-	PyObject	*agent;
-
-	if (pyreq->req->agent == NULL) {
-		Py_RETURN_NONE;
-	}
-
-	if ((agent = PyUnicode_FromString(pyreq->req->path)) == NULL)
-		return (PyErr_NoMemory());
-
-	return (agent);
+	return (PyUnicode_FromString(pyreq->req->path));
 }
 
 static PyObject *
 pyhttp_get_method(struct pyhttp_request *pyreq, void *closure)
 {
-	PyObject	*method;
+	return (PyLong_FromUnsignedLong(pyreq->req->method));
+}
 
-	if ((method = PyLong_FromUnsignedLong(pyreq->req->method)) == NULL)
-		return (PyErr_NoMemory());
+static PyObject *
+pyhttp_get_protocol(struct pyhttp_request *pyreq, void *closure)
+{
+	struct connection	*c;
+	const char		*proto;
 
-	return (method);
+	c = pyreq->req->owner;
+
+	if (c->owner->server->tls)
+		proto = "https";
+	else
+		proto = "http";
+
+	return (PyUnicode_FromString(proto));
 }
 
 static PyObject *
 pyhttp_get_body_path(struct pyhttp_request *pyreq, void *closure)
 {
-	PyObject	*path;
-
 	if (pyreq->req->http_body_path == NULL) {
 		Py_RETURN_NONE;
 	}
 
-	if ((path = PyUnicode_FromString(pyreq->req->http_body_path)) == NULL)
-		return (PyErr_NoMemory());
+	return (PyUnicode_FromString(pyreq->req->http_body_path));
+}
 
-	return (path);
+static PyObject *
+pyhttp_get_body_digest(struct pyhttp_request *pyreq, void *closure)
+{
+	PyObject	*digest;
+
+	digest = PyBytes_FromStringAndSize((char *)pyreq->req->http_body_digest,
+	    sizeof(pyreq->req->http_body_digest));
+
+	return (digest);
 }
 
 static PyObject *
@@ -3553,10 +5479,665 @@ pyhttp_file_get_filename(struct pyhttp_file *pyfile, void *closure)
 	return (name);
 }
 
+void
+pyroute_dealloc(struct pyroute *route)
+{
+	kore_free(route->path);
+
+	Py_XDECREF(route->func);
+	Py_XDECREF(route->kwargs);
+
+	PyObject_Del((PyObject *)route);
+}
+
+static PyObject *
+pyroute_inner(struct pyroute *route, PyObject *args)
+{
+	PyObject	*obj;
+
+	if (!PyArg_ParseTuple(args, "O", &obj))
+		return (NULL);
+
+	if (!PyCallable_Check(obj))
+		return (NULL);
+
+	route->func = obj;
+	Py_INCREF(route->func);
+
+	TAILQ_INSERT_TAIL(&routes, route, list);
+
+	return (route->func);
+}
+
+void
+pydomain_dealloc(struct pydomain *domain)
+{
+	PyObject_Del((PyObject *)domain);
+}
+
+static int
+pydomain_set_accesslog(struct pydomain *domain, PyObject *arg, void *closure)
+{
+	const char		*path;
+
+	if (!PyUnicode_CheckExact(arg))
+		return (-1);
+
+	if (domain->config->accesslog != -1) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "domain %s accesslog already set", domain->config->domain);
+		return (-1);
+	}
+
+	path = PyUnicode_AsUTF8(arg);
+
+	domain->config->accesslog = open(path,
+	    O_CREAT | O_APPEND | O_WRONLY,
+	    S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+
+	if (domain->config->accesslog == -1) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "failed to open accesslog for %s (%s:%s)",
+		    domain->config->domain, path, errno_s);
+		return (-1);
+	}
+
+	return (0);
+}
+
+static PyObject *
+pydomain_filemaps(struct pydomain *domain, PyObject *args)
+{
+	Py_ssize_t		idx;
+	struct kore_route	*rt;
+	const char		*url, *path;
+	PyObject		*dict, *key, *value, *auth;
+
+	if (!PyArg_ParseTuple(args, "O", &dict))
+		return (NULL);
+
+	if (!PyDict_CheckExact(dict)) {
+		PyErr_SetString(PyExc_RuntimeError, "filemaps not a dict");
+		return (NULL);
+	}
+
+	idx = 0;
+	while (PyDict_Next(dict, &idx, &key, &value)) {
+		if (!PyUnicode_CheckExact(key)) {
+			PyErr_SetString(PyExc_RuntimeError,
+			    "filemap key not a string");
+			return (NULL);
+		}
+
+		url = PyUnicode_AsUTF8(key);
+
+		if (!PyUnicode_CheckExact(value) &&
+		    !PyTuple_CheckExact(value)) {
+			PyErr_SetString(PyExc_RuntimeError,
+			    "filemap value can be either be a string or tuple");
+			return (NULL);
+		}
+
+		if (PyTuple_CheckExact(value)) {
+			auth = PyTuple_GetItem(value, 1);
+			if (!PyDict_CheckExact(auth)) {
+				PyErr_SetString(PyExc_RuntimeError,
+				    "filemap value tuple auth is not a dict");
+				return (NULL);
+			}
+
+			value = PyTuple_GetItem(value, 0);
+			if (!PyUnicode_CheckExact(value)) {
+				PyErr_SetString(PyExc_RuntimeError,
+				    "filemap value tuple path is invalid");
+				return (NULL);
+			}
+		} else {
+			auth = NULL;
+		}
+
+		path = PyUnicode_AsUTF8(value);
+
+		rt = kore_filemap_create(domain->config, path, url, NULL);
+		if (rt == NULL) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "failed to create filemap %s->%s for %s",
+			    url, path, domain->config->domain);
+			return (NULL);
+		}
+
+		if (auth != NULL) {
+			if (!python_route_auth(auth, rt)) {
+				kore_python_log_error("python_route_auth");
+				kore_route_free(rt);
+				return (KORE_RESULT_ERROR);
+			}
+		}
+	}
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+pydomain_redirect(struct pydomain *domain, PyObject *args)
+{
+	int			status;
+	const char		*src, *dst;
+
+	if (!PyArg_ParseTuple(args, "sis", &src, &status, &dst))
+		return (NULL);
+
+	if (!http_redirect_add(domain->config, src, status, dst)) {
+		fatal("failed to add redirect '%s' on '%s'",
+		    src, domain->config->domain);
+	}
+
+	Py_RETURN_NONE;
+}
+
+static PyObject *
+pydomain_route(struct pydomain *domain, PyObject *args, PyObject *kwargs)
+{
+	PyObject		*obj;
+	const char		*path;
+	struct pyroute		*route;
+
+	if (!PyArg_ParseTuple(args, "sO", &path, &obj))
+		return (NULL);
+
+	if (!PyCallable_Check(obj))
+		return (NULL);
+
+	if ((route = PyObject_New(struct pyroute, &pyroute_type)) == NULL)
+		return (NULL);
+
+	route->kwargs = kwargs;
+	route->domain = domain->config;
+	route->path = kore_strdup(path);
+
+	Py_XINCREF(route->kwargs);
+
+	route->func = obj;
+	Py_INCREF(route->func);
+
+	TAILQ_INSERT_TAIL(&routes, route, list);
+
+	Py_RETURN_NONE;
+}
+
+static int
+python_route_install(struct pyroute *route)
+{
+	const char			*val;
+	struct kore_domain		*domain;
+	struct kore_route		*rt, *entry;
+	PyObject			*kwargs, *repr, *obj;
+
+	if ((repr = PyObject_Repr(route->func)) == NULL) {
+		kore_python_log_error("python_route_install");
+		return (KORE_RESULT_ERROR);
+	}
+
+	domain = python_route_domain_resolve(route);
+
+	rt = kore_calloc(1, sizeof(*rt));
+	rt->dom = domain;
+	rt->methods = HTTP_METHOD_ALL;
+	rt->path = kore_strdup(route->path);
+
+	TAILQ_INIT(&rt->params);
+
+	val = PyUnicode_AsUTF8(repr);
+	rt->func = kore_strdup(val);
+
+	kwargs = route->kwargs;
+
+	rt->rcall = kore_calloc(1, sizeof(struct kore_runtime_call));
+	rt->rcall->addr = route->func;
+	rt->rcall->runtime = &kore_python_runtime;
+	Py_INCREF(rt->rcall->addr);
+
+	if (kwargs != NULL) {
+		if ((obj = PyDict_GetItemString(kwargs, "methods")) != NULL) {
+			if (!python_route_methods(obj, kwargs, rt)) {
+				kore_python_log_error("python_route_install");
+				kore_route_free(rt);
+				return (KORE_RESULT_ERROR);
+			}
+		}
+
+		if ((obj = PyDict_GetItemString(kwargs, "auth")) != NULL) {
+			if (!python_route_auth(obj, rt)) {
+				kore_python_log_error("python_route_install");
+				kore_route_free(rt);
+				return (KORE_RESULT_ERROR);
+			}
+		}
+
+		if ((obj = PyDict_GetItemString(kwargs, "hooks")) != NULL) {
+			if (!python_route_hooks(obj, rt)) {
+				kore_python_log_error("python_route_install");
+				kore_route_free(rt);
+				return (KORE_RESULT_ERROR);
+			}
+		}
+	}
+
+	if (rt->path[0] == '/') {
+		rt->type = HANDLER_TYPE_STATIC;
+	} else {
+		rt->type = HANDLER_TYPE_DYNAMIC;
+		if (regcomp(&rt->rctx, rt->path, REG_EXTENDED))
+			fatal("failed to compile regex for '%s'", rt->path);
+	}
+
+	TAILQ_FOREACH(entry, &domain->routes, list) {
+		if (!strcmp(entry->path, rt->path) &&
+		    (entry->methods & rt->methods))
+			fatal("duplicate route for '%s'", route->path);
+	}
+
+	TAILQ_INSERT_TAIL(&domain->routes, rt, list);
+
+	return (KORE_RESULT_OK);
+}
+
+static struct kore_domain *
+python_route_domain_resolve(struct pyroute *route)
+{
+	struct kore_server	*srv;
+	const char		*name;
+	struct kore_domain	*domain;
+
+	if (route->domain != NULL)
+		return (route->domain);
+
+	if (route->kwargs != NULL)
+		name = python_string_from_dict(route->kwargs, "domain");
+	else
+		name = NULL;
+
+	if (name != NULL) {
+		domain = NULL;
+		LIST_FOREACH(srv, &kore_servers, list) {
+			TAILQ_FOREACH(domain, &srv->domains, list) {
+				if (!strcmp(domain->domain, name))
+					break;
+			}
+		}
+
+		if (domain == NULL)
+			fatal("domain '%s' does not exist", name);
+	} else {
+		if ((domain = kore_domain_byid(1)) != NULL)
+			fatal("ambiguous domain on route, please specify one");
+		if ((domain = kore_domain_byid(0)) == NULL)
+			fatal("no domains configured, please configure one");
+	}
+
+	return (domain);
+}
+
+static int
+python_route_methods(PyObject *obj, PyObject *kwargs, struct kore_route *rt)
+{
+	const char		*val;
+	PyObject		*item;
+	int			method;
+	Py_ssize_t		list_len, idx;
+
+	if (!PyList_CheckExact(obj)) {
+		PyErr_SetString(PyExc_RuntimeError, "methods not a list");
+		return (KORE_RESULT_ERROR);
+	}
+
+	rt->methods = 0;
+	list_len = PyList_Size(obj);
+
+	for (idx = 0; idx < list_len; idx++) {
+		if ((item = PyList_GetItem(obj, idx)) == NULL)
+			return (KORE_RESULT_ERROR);
+
+		if ((val = PyUnicode_AsUTF8(item)) == NULL)
+			return (KORE_RESULT_ERROR);
+
+		if ((method = http_method_value(val)) == 0) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "unknown HTTP method: %s", val);
+			return (KORE_RESULT_ERROR);
+		}
+
+		rt->methods |= method;
+		if (method == HTTP_METHOD_GET)
+			rt->methods |= HTTP_METHOD_HEAD;
+
+		if (!python_route_params(kwargs, rt, val, method, 0))
+			return (KORE_RESULT_ERROR);
+
+		if (!python_route_params(kwargs, rt, "qs", method, 1))
+			return (KORE_RESULT_ERROR);
+	}
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+python_route_params(PyObject *kwargs, struct kore_route *rt,
+    const char *method, int type, int qs)
+{
+	Py_ssize_t			idx;
+	const char			*val;
+	int				vtype;
+	struct kore_validator		*vldr;
+	struct kore_route_params	*param;
+	PyObject			*obj, *key, *item;
+
+	if ((obj = PyDict_GetItemString(kwargs, method)) == NULL)
+		return (KORE_RESULT_OK);
+
+	if (!PyDict_CheckExact(obj))
+		return (KORE_RESULT_ERROR);
+
+	idx = 0;
+	while (PyDict_Next(obj, &idx, &key, &item)) {
+		if (!PyUnicode_CheckExact(key))
+			return (KORE_RESULT_ERROR);
+
+		val = PyUnicode_AsUTF8(key);
+
+		if (PyUnicode_CheckExact(item)) {
+			vtype = KORE_VALIDATOR_TYPE_REGEX;
+		} else if (PyCallable_Check(item)) {
+			vtype = KORE_VALIDATOR_TYPE_FUNCTION;
+		} else {
+			PyErr_Format(PyExc_RuntimeError,
+			    "validator '%s' must be regex or function", val);
+			return (KORE_RESULT_ERROR);
+		}
+
+		vldr = kore_calloc(1, sizeof(*vldr));
+		vldr->type = vtype;
+
+		if (vtype == KORE_VALIDATOR_TYPE_REGEX) {
+			val = PyUnicode_AsUTF8(item);
+			if (regcomp(&(vldr->rctx),
+			    val, REG_EXTENDED | REG_NOSUB)) {
+				PyErr_Format(PyExc_RuntimeError,
+				    "Invalid regex (%s)", val);
+				kore_free(vldr);
+				return (KORE_RESULT_ERROR);
+			}
+		} else {
+			vldr->rcall = kore_calloc(1, sizeof(*vldr->rcall));
+			vldr->rcall->addr = item;
+			vldr->rcall->runtime = &kore_python_runtime;
+			Py_INCREF(item);
+		}
+
+		val = PyUnicode_AsUTF8(key);
+		vldr->name = kore_strdup(val);
+
+		param = kore_calloc(1, sizeof(*param));
+		param->flags = 0;
+		param->method = type;
+		param->validator = vldr;
+		param->name = kore_strdup(val);
+
+		if (type == HTTP_METHOD_GET || qs == 1)
+			param->flags = KORE_PARAMS_QUERY_STRING;
+
+		TAILQ_INSERT_TAIL(&rt->params, param, list);
+	}
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+python_route_auth(PyObject *dict, struct kore_route *rt)
+{
+	int			type;
+	struct kore_auth	*auth;
+	struct kore_validator	*vldr;
+	PyObject		*obj, *repr;
+	const char		*value, *redir;
+
+	if (!PyDict_CheckExact(dict))
+		return (KORE_RESULT_ERROR);
+
+	if ((value = python_string_from_dict(dict, "type")) == NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "missing or invalid 'type' keyword");
+		return (KORE_RESULT_ERROR);
+	}
+
+	if (!strcmp(value, "cookie")) {
+		type = KORE_AUTH_TYPE_COOKIE;
+	} else if (!strcmp(value, "header")) {
+		type = KORE_AUTH_TYPE_HEADER;
+	} else {
+		PyErr_Format(PyExc_RuntimeError,
+		    "invalid 'type' (%s) in auth dictionary for '%s'",
+		    value, rt->path);
+		return (KORE_RESULT_ERROR);
+	}
+
+	if ((value = python_string_from_dict(dict, "value")) == NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "missing or invalid 'value' keyword");
+		return (KORE_RESULT_ERROR);
+	}
+
+	redir = python_string_from_dict(dict, "redirect");
+
+	if ((obj = PyDict_GetItemString(dict, "verify")) == NULL ||
+	    !PyCallable_Check(obj)) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "missing 'verify' in auth dictionary for '%s'", rt->path);
+		return (KORE_RESULT_ERROR);
+	}
+
+	auth = kore_calloc(1, sizeof(*auth));
+	auth->type = type;
+	auth->value = kore_strdup(value);
+
+	if (redir != NULL)
+		auth->redirect = kore_strdup(redir);
+
+	vldr = kore_calloc(1, sizeof(*vldr));
+	vldr->type = KORE_VALIDATOR_TYPE_FUNCTION;
+
+	vldr->rcall = kore_calloc(1, sizeof(*vldr->rcall));
+	vldr->rcall->addr = obj;
+	vldr->rcall->runtime = &kore_python_runtime;
+	Py_INCREF(obj);
+
+	if ((repr = PyObject_Repr(obj)) == NULL) {
+		kore_free(vldr->rcall);
+		kore_free(vldr);
+		kore_free(auth);
+		return (KORE_RESULT_ERROR);
+	}
+
+	value = PyUnicode_AsUTF8(repr);
+	vldr->name = kore_strdup(value);
+	Py_DECREF(repr);
+
+	auth->validator = vldr;
+	rt->auth = auth;
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+python_route_hooks(PyObject *dict, struct kore_route *rt)
+{
+	if (!PyDict_CheckExact(dict))
+		return (KORE_RESULT_ERROR);
+
+	if (!python_route_hook_set(dict, "on_free", &rt->on_free))
+		return (KORE_RESULT_ERROR);
+
+	if (!python_route_hook_set(dict, "on_headers", &rt->on_headers))
+		return (KORE_RESULT_ERROR);
+
+	if (!python_route_hook_set(dict, "on_body_chunk", &rt->on_body_chunk))
+		return (KORE_RESULT_ERROR);
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+python_route_hook_set(PyObject *dict, const char *name,
+    struct kore_runtime_call **out)
+{
+	PyObject			*obj;
+	struct kore_runtime_call	*rcall;
+
+	if ((obj = PyDict_GetItemString(dict, name)) == NULL)
+		return (KORE_RESULT_OK);
+
+	if (!PyCallable_Check(obj)) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "%s for a route not callable", name);
+		Py_DECREF(obj);
+		return (KORE_RESULT_ERROR);
+	}
+
+	rcall = kore_calloc(1, sizeof(struct kore_runtime_call));
+	rcall->addr = obj;
+	rcall->runtime = &kore_python_runtime;
+
+	Py_INCREF(rcall->addr);
+	*out = rcall;
+
+	return (KORE_RESULT_OK);
+}
+
 #if defined(KORE_USE_PGSQL)
+static PyObject *
+python_kore_pgsql_query(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+	struct pykore_pgsql	*op;
+	PyObject		*obj;
+	const char		*db, *query;
+
+	if (!PyArg_ParseTuple(args, "ss", &db, &query))
+		return (NULL);
+
+	op = PyObject_New(struct pykore_pgsql, &pykore_pgsql_type);
+	if (op == NULL)
+		return (NULL);
+
+	op->binary = 0;
+	op->param.count = 0;
+	op->param.objs = NULL;
+	op->param.values = NULL;
+	op->param.lengths = NULL;
+	op->param.formats = NULL;
+
+	op->result = NULL;
+	op->coro = coro_running;
+	op->db = kore_strdup(db);
+	op->query = kore_strdup(query);
+	op->state = PYKORE_PGSQL_PREINIT;
+
+	memset(&op->sql, 0, sizeof(op->sql));
+
+	if (kwargs != NULL) {
+		if ((obj = PyDict_GetItemString(kwargs, "params")) != NULL) {
+			if (!pykore_pgsql_params(op, obj)) {
+				Py_DECREF((PyObject *)op);
+				return (NULL);
+			}
+		}
+
+		if ((obj = PyDict_GetItemString(kwargs, "binary")) != NULL) {
+			if (obj == Py_True) {
+				op->binary = 1;
+			} else if (obj == Py_False) {
+				op->binary = 0;
+			} else {
+				Py_DECREF((PyObject *)op);
+				PyErr_SetString(PyExc_RuntimeError,
+				    "pgsql: binary not True or False");
+				return (NULL);
+			}
+		}
+	}
+
+	return ((PyObject *)op);
+}
+
+static int
+pykore_pgsql_params(struct pykore_pgsql *op, PyObject *list)
+{
+	union { const char *cp; char *p; }	ptr;
+	PyObject				*item;
+	int					format;
+	Py_ssize_t				i, len, vlen;
+
+	if (!PyList_CheckExact(list)) {
+		if (list == Py_None)
+			return (KORE_RESULT_OK);
+
+		PyErr_SetString(PyExc_RuntimeError,
+		    "pgsql: params keyword must be a list");
+		return (KORE_RESULT_ERROR);
+	}
+
+	len = PyList_Size(list);
+	if (len == 0)
+		return (KORE_RESULT_OK);
+
+	if (len > INT_MAX) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "pgsql: list length too large");
+		return (KORE_RESULT_ERROR);
+	}
+
+	op->param.count = len;
+	op->param.lengths = kore_calloc(len, sizeof(int));
+	op->param.formats = kore_calloc(len, sizeof(int));
+	op->param.values = kore_calloc(len, sizeof(char *));
+	op->param.objs = kore_calloc(len, sizeof(PyObject *));
+
+	for (i = 0; i < len; i++) {
+		if ((item = PyList_GetItem(list, i)) == NULL)
+			return (KORE_RESULT_ERROR);
+
+		if (PyUnicode_CheckExact(item)) {
+			format = 0;
+			ptr.cp = PyUnicode_AsUTF8AndSize(item, &vlen);
+		} else if (PyBytes_CheckExact(item)) {
+			format = 1;
+			if (PyBytes_AsStringAndSize(item, &ptr.p, &vlen) == -1)
+				ptr.p = NULL;
+		} else {
+			PyErr_Format(PyExc_RuntimeError,
+			    "pgsql: item %zu is not a string or bytes", i);
+			return (KORE_RESULT_ERROR);
+		}
+
+		if (ptr.cp == NULL)
+			return (KORE_RESULT_ERROR);
+
+		op->param.lengths[i] = vlen;
+		op->param.values[i] = ptr.cp;
+		op->param.formats[i] = format;
+
+		/* Hold on to it since we are directly referencing its data. */
+		op->param.objs[i] = item;
+		Py_INCREF(item);
+	}
+
+	return (KORE_RESULT_OK);
+}
+
 static void
 pykore_pgsql_dealloc(struct pykore_pgsql *pysql)
 {
+	Py_ssize_t	i;
+
 	kore_free(pysql->db);
 	kore_free(pysql->query);
 	kore_pgsql_cleanup(&pysql->sql);
@@ -3564,27 +6145,15 @@ pykore_pgsql_dealloc(struct pykore_pgsql *pysql)
 	if (pysql->result != NULL)
 		Py_DECREF(pysql->result);
 
+	for (i = 0; i < pysql->param.count; i++)
+		Py_XDECREF(pysql->param.objs[i]);
+
+	kore_free(pysql->param.objs);
+	kore_free(pysql->param.values);
+	kore_free(pysql->param.lengths);
+	kore_free(pysql->param.formats);
+
 	PyObject_Del((PyObject *)pysql);
-}
-
-static PyObject *
-pykore_pgsql_alloc(struct http_request *req, const char *db, const char *query)
-{
-	struct pykore_pgsql	*pysql;
-
-	pysql = PyObject_New(struct pykore_pgsql, &pykore_pgsql_type);
-	if (pysql == NULL)
-		return (NULL);
-
-	pysql->req = req;
-	pysql->result = NULL;
-	pysql->db = kore_strdup(db);
-	pysql->query = kore_strdup(query);
-	pysql->state = PYKORE_PGSQL_PREINIT;
-
-	memset(&pysql->sql, 0, sizeof(pysql->sql));
-
-	return ((PyObject *)pysql);
 }
 
 static PyObject *
@@ -3593,7 +6162,8 @@ pykore_pgsql_iternext(struct pykore_pgsql *pysql)
 	switch (pysql->state) {
 	case PYKORE_PGSQL_PREINIT:
 		kore_pgsql_init(&pysql->sql);
-		kore_pgsql_bind_request(&pysql->sql, pysql->req);
+		kore_pgsql_bind_callback(&pysql->sql,
+		    pykore_pgsql_callback, pysql);
 		pysql->state = PYKORE_PGSQL_INITIALIZE;
 		/* fallthrough */
 	case PYKORE_PGSQL_INITIALIZE:
@@ -3601,16 +6171,27 @@ pykore_pgsql_iternext(struct pykore_pgsql *pysql)
 		    KORE_PGSQL_ASYNC)) {
 			if (pysql->sql.state == KORE_PGSQL_STATE_INIT)
 				break;
-			kore_pgsql_logerror(&pysql->sql);
-			PyErr_SetString(PyExc_RuntimeError, "pgsql error");
+			PyErr_Format(PyExc_RuntimeError, "pgsql error: %s",
+			    pysql->sql.error);
 			return (NULL);
 		}
 		/* fallthrough */
 	case PYKORE_PGSQL_QUERY:
-		if (!kore_pgsql_query(&pysql->sql, pysql->query)) {
-			kore_pgsql_logerror(&pysql->sql);
-			PyErr_SetString(PyExc_RuntimeError, "pgsql error");
-			return (NULL);
+		if (pysql->param.count > 0) {
+			if (!kore_pgsql_query_param_fields(&pysql->sql,
+			    pysql->query, pysql->binary,
+			    pysql->param.count, pysql->param.values,
+			    pysql->param.lengths, pysql->param.formats)) {
+				PyErr_Format(PyExc_RuntimeError,
+				    "pgsql error: %s", pysql->sql.error);
+				return (NULL);
+			}
+		} else {
+			if (!kore_pgsql_query(&pysql->sql, pysql->query)) {
+				PyErr_Format(PyExc_RuntimeError,
+				    "pgsql error: %s", pysql->sql.error);
+				return (NULL);
+			}
 		}
 		pysql->state = PYKORE_PGSQL_WAIT;
 		break;
@@ -3625,14 +6206,14 @@ wait_again:
 				PyErr_SetObject(PyExc_StopIteration,
 				    pysql->result);
 				Py_DECREF(pysql->result);
+				pysql->result = NULL;
 			} else {
 				PyErr_SetObject(PyExc_StopIteration, Py_None);
 			}
 			return (NULL);
 		case KORE_PGSQL_STATE_ERROR:
-			kore_pgsql_logerror(&pysql->sql);
-			PyErr_SetString(PyExc_RuntimeError,
-			    "failed to perform query");
+			PyErr_Format(PyExc_RuntimeError,
+			    "failed to perform query: %s", pysql->sql.error);
 			return (NULL);
 		case KORE_PGSQL_STATE_RESULT:
 			if (!pykore_pgsql_result(pysql))
@@ -3652,6 +6233,17 @@ wait_again:
 	Py_RETURN_NONE;
 }
 
+static void
+pykore_pgsql_callback(struct kore_pgsql *pgsql, void *arg)
+{
+	struct pykore_pgsql	*op = arg;
+
+	if (op->coro->request != NULL)
+		http_request_wakeup(op->coro->request);
+	else
+		python_coro_wakeup(op->coro);
+}
+
 static PyObject *
 pykore_pgsql_await(PyObject *obj)
 {
@@ -3659,13 +6251,13 @@ pykore_pgsql_await(PyObject *obj)
 	return (obj);
 }
 
-int
+static int
 pykore_pgsql_result(struct pykore_pgsql *pysql)
 {
 	const char	*val;
 	char		key[64];
 	PyObject	*list, *pyrow, *pyval;
-	int		rows, row, field, fields;
+	int		rows, row, field, fields, len;
 
 	if ((list = PyList_New(0)) == NULL) {
 		PyErr_SetNone(PyExc_MemoryError);
@@ -3684,8 +6276,14 @@ pykore_pgsql_result(struct pykore_pgsql *pysql)
 
 		for (field = 0; field < fields; field++) {
 			val = kore_pgsql_getvalue(&pysql->sql, row, field);
+			len = kore_pgsql_getlength(&pysql->sql, row, field);
 
-			pyval = PyUnicode_FromString(val);
+			if (kore_pgsql_column_binary(&pysql->sql, field)) {
+				pyval = PyBytes_FromStringAndSize(val, len);
+			} else {
+				pyval = PyUnicode_FromString(val);
+			}
+
 			if (pyval == NULL) {
 				Py_DECREF(pyrow);
 				Py_DECREF(list);
@@ -3724,22 +6322,712 @@ pykore_pgsql_result(struct pykore_pgsql *pysql)
 
 	return (KORE_RESULT_OK);
 }
+#endif
+
+#if defined(KORE_USE_CURL)
+static PyObject *
+python_curlopt_set(struct pycurl_data *data, long opt, PyObject *value)
+{
+	int		i;
+
+	for (i = 0; py_curlopt[i].name != NULL; i++) {
+		if (py_curlopt[i].value == opt)
+			break;
+	}
+
+	if (py_curlopt[i].name == NULL) {
+		PyErr_Format(PyExc_RuntimeError, "invalid option '%ld'", opt);
+		return (NULL);
+	}
+
+	if (py_curlopt[i].cb == NULL) {
+		PyErr_Format(PyExc_RuntimeError, "option '%s' not implemented",
+		    py_curlopt[i].name);
+		return (NULL);
+	}
+
+	return (py_curlopt[i].cb(data, i, value));
+}
+
+static int
+python_curlopt_from_dict(struct pycurl_data *data, PyObject *dict)
+{
+	long		opt;
+	Py_ssize_t	idx;
+	PyObject	*key, *value, *obj;
+
+	idx = 0;
+
+	if (!PyDict_CheckExact(dict)) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "curlopt must be a dictionary");
+		return (KORE_RESULT_ERROR);
+	}
+
+	while (PyDict_Next(dict, &idx, &key, &value)) {
+		if (!PyLong_CheckExact(key)) {
+			PyErr_Format(PyExc_RuntimeError,
+			    "invalid key in curlopt keyword");
+			return (KORE_RESULT_ERROR);
+		}
+
+		opt = PyLong_AsLong(key);
+
+		if ((obj = python_curlopt_set(data, opt, value)) == NULL)
+			return (KORE_RESULT_ERROR);
+
+		Py_DECREF(obj);
+	}
+
+	return (KORE_RESULT_OK);
+}
 
 static PyObject *
-pyhttp_pgsql(struct pyhttp_request *pyreq, PyObject *args)
+python_kore_curl_handle(PyObject *self, PyObject *args)
 {
-	PyObject			*obj;
-	const char			*db, *query;
+	const char		*url;
+	struct pycurl_handle	*handle;
 
-	if (!PyArg_ParseTuple(args, "ss", &db, &query))
+	if (!PyArg_ParseTuple(args, "s", &url))
 		return (NULL);
 
-	if ((obj = pykore_pgsql_alloc(pyreq->req, db, query)) == NULL)
-		return (PyErr_NoMemory());
+	handle = PyObject_New(struct pycurl_handle, &pycurl_handle_type);
+	if (handle == NULL)
+		return (NULL);
 
-	Py_INCREF(obj);
-	pyreq->data = obj;
+	handle->url = kore_strdup(url);
+	memset(&handle->data.curl, 0, sizeof(handle->data.curl));
 
-	return ((PyObject *)obj);
+	handle->body = NULL;
+	LIST_INIT(&handle->data.slists);
+
+	if (!kore_curl_init(&handle->data.curl, handle->url, KORE_CURL_ASYNC)) {
+		Py_DECREF((PyObject *)handle);
+		PyErr_SetString(PyExc_RuntimeError, "failed to setup call");
+		return (NULL);
+	}
+
+	return ((PyObject *)handle);
+}
+
+static void
+pycurl_handle_dealloc(struct pycurl_handle *handle)
+{
+	struct pycurl_slist	*psl;
+
+	while ((psl = LIST_FIRST(&handle->data.slists))) {
+		LIST_REMOVE(psl, list);
+		curl_slist_free_all(psl->slist);
+		kore_free(psl);
+	}
+
+	if (handle->body != NULL)
+		kore_buf_free(handle->body);
+
+	kore_free(handle->url);
+	kore_curl_cleanup(&handle->data.curl);
+
+	PyObject_Del((PyObject *)handle);
+}
+
+static PyObject *
+pycurl_handle_setbody(struct pycurl_handle *handle, PyObject *args)
+{
+	PyObject		*obj;
+	char			*ptr;
+	Py_ssize_t		length;
+
+	if (!PyArg_ParseTuple(args, "O", &obj))
+		return (NULL);
+
+	if (handle->body != NULL) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "curl handle already has body attached");
+		return (NULL);
+	}
+
+	if (!PyBytes_CheckExact(obj)) {
+		PyErr_SetString(PyExc_RuntimeError,
+		    "curl.setbody expects bytes");
+		return (NULL);
+	}
+
+	if (PyBytes_AsStringAndSize(obj, &ptr, &length) == -1)
+		return (NULL);
+
+	if (length < 0) {
+		PyErr_SetString(PyExc_TypeError, "invalid length");
+		return (NULL);
+	}
+
+	handle->body = kore_buf_alloc(length);
+	kore_buf_append(handle->body, ptr, length);
+	kore_buf_reset(handle->body);
+
+	curl_easy_setopt(handle->data.curl.handle,
+	    CURLOPT_READFUNCTION, kore_curl_frombuf);
+	curl_easy_setopt(handle->data.curl.handle,
+	    CURLOPT_READDATA, handle->body);
+
+	curl_easy_setopt(handle->data.curl.handle, CURLOPT_UPLOAD, 1);
+
+	Py_RETURN_TRUE;
+}
+
+static PyObject *
+pycurl_handle_setopt(struct pycurl_handle *handle, PyObject *args)
+{
+	int		opt;
+	PyObject	*value;
+
+	if (!PyArg_ParseTuple(args, "iO", &opt, &value))
+		return (NULL);
+
+	return (python_curlopt_set(&handle->data, opt, value));
+}
+
+static PyObject *
+pycurl_handle_setopt_string(struct pycurl_data *data, int idx, PyObject *obj)
+{
+	const char		*str;
+	CURLoption		option;
+
+	if (!PyUnicode_Check(obj)) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "option '%s' requires a string as argument",
+		    py_curlopt[idx].name);
+		return (NULL);
+	}
+
+	if ((str = PyUnicode_AsUTF8(obj)) == NULL)
+		return (NULL);
+
+	option = CURLOPTTYPE_OBJECTPOINT + py_curlopt[idx].value;
+	curl_easy_setopt(data->curl.handle, option, str);
+
+	Py_RETURN_TRUE;
+}
+
+static PyObject *
+pycurl_handle_setopt_long(struct pycurl_data *data, int idx, PyObject *obj)
+{
+	long		val;
+	CURLoption	option;
+
+	if (!PyLong_CheckExact(obj)) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "option '%s' requires a long as argument",
+		    py_curlopt[idx].name);
+		return (NULL);
+	}
+
+	PyErr_Clear();
+	val = PyLong_AsLong(obj);
+	if (val == -1 && PyErr_Occurred())
+		return (NULL);
+
+	option = CURLOPTTYPE_LONG + py_curlopt[idx].value;
+	curl_easy_setopt(data->curl.handle, option, val);
+
+	Py_RETURN_TRUE;
+}
+
+static PyObject *
+pycurl_handle_setopt_slist(struct pycurl_data *data, int idx, PyObject *obj)
+{
+	struct pycurl_slist	*psl;
+	PyObject		*item;
+	const char		*sval;
+	struct curl_slist	*slist;
+	CURLoption		option;
+	Py_ssize_t		list_len, i;
+
+	if (!PyList_CheckExact(obj)) {
+		PyErr_Format(PyExc_RuntimeError,
+		    "option '%s' requires a list as argument",
+		    py_curlopt[idx].name);
+		return (NULL);
+	}
+
+	slist = NULL;
+	list_len = PyList_Size(obj);
+
+	for (i = 0; i < list_len; i++) {
+		if ((item = PyList_GetItem(obj, i)) == NULL)
+			return (NULL);
+
+		if (!PyUnicode_Check(item))
+			return (NULL);
+
+		if ((sval = PyUnicode_AsUTF8AndSize(item, NULL)) == NULL)
+			return (NULL);
+
+		if ((slist = curl_slist_append(slist, sval)) == NULL)
+			fatal("%s: curl_slist_append failed", __func__);
+	}
+
+	psl = kore_calloc(1, sizeof(*psl));
+	psl->slist = slist;
+	LIST_INSERT_HEAD(&data->slists, psl, list);
+
+	option = CURLOPTTYPE_OBJECTPOINT + py_curlopt[idx].value;
+	curl_easy_setopt(data->curl.handle, option, slist);
+
+	Py_RETURN_TRUE;
+}
+
+static PyObject *
+pycurl_handle_run(struct pycurl_handle *handle, PyObject *args)
+{
+	struct pycurl_handle_op		*op;
+
+	op = PyObject_New(struct pycurl_handle_op, &pycurl_handle_op_type);
+	if (op == NULL)
+		return (NULL);
+
+	Py_INCREF(handle);
+
+	op->handle = handle;
+	op->coro = coro_running;
+	op->state = CURL_CLIENT_OP_RUN;
+
+	kore_curl_bind_callback(&handle->data.curl,
+	    python_curl_handle_callback, op);
+
+	return ((PyObject *)op);
+}
+
+static void
+pycurl_handle_op_dealloc(struct pycurl_handle_op *op)
+{
+	Py_DECREF(op->handle);
+	PyObject_Del((PyObject *)op);
+}
+
+static PyObject *
+pycurl_handle_op_await(PyObject *op)
+{
+	Py_INCREF(op);
+	return (op);
+}
+
+static PyObject *
+pycurl_handle_op_iternext(struct pycurl_handle_op *op)
+{
+	size_t			len;
+	PyObject		*result;
+	const u_int8_t		*response;
+
+	if (op->state == CURL_CLIENT_OP_RUN) {
+		kore_curl_run(&op->handle->data.curl);
+		op->state = CURL_CLIENT_OP_RESULT;
+		Py_RETURN_NONE;
+	}
+
+	if (op->handle->body != NULL) {
+		kore_buf_free(op->handle->body);
+		op->handle->body = NULL;
+	}
+
+	if (!kore_curl_success(&op->handle->data.curl)) {
+		/* Do not log the url here, may contain some sensitive data. */
+		PyErr_Format(PyExc_RuntimeError, "request failed: %s",
+		    kore_curl_strerror(&op->handle->data.curl));
+		return (NULL);
+	}
+
+	kore_curl_response_as_bytes(&op->handle->data.curl, &response, &len);
+
+	if ((result = PyBytes_FromStringAndSize((const char *)response,
+	    len)) == NULL)
+		return (NULL);
+
+	PyErr_SetObject(PyExc_StopIteration, result);
+	Py_DECREF(result);
+
+	return (NULL);
+}
+
+static PyObject *
+python_kore_httpclient(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+	struct pyhttp_client	*client;
+	const char		*url, *v;
+
+	if (!PyArg_ParseTuple(args, "s", &url))
+		return (NULL);
+
+	client = PyObject_New(struct pyhttp_client, &pyhttp_client_type);
+	if (client == NULL)
+		return (NULL);
+
+	client->unix = NULL;
+	client->tlskey = NULL;
+	client->curlopt = NULL;
+	client->tlscert = NULL;
+	client->cabundle = NULL;
+
+	client->tlsverify = 1;
+	client->url = kore_strdup(url);
+
+	if (kwargs != NULL) {
+		if ((v = python_string_from_dict(kwargs, "tlscert")) != NULL)
+			client->tlscert = kore_strdup(v);
+
+		if ((v = python_string_from_dict(kwargs, "tlskey")) != NULL)
+			client->tlskey = kore_strdup(v);
+
+		if ((v = python_string_from_dict(kwargs, "cabundle")) != NULL)
+			client->cabundle = kore_strdup(v);
+
+		if ((v = python_string_from_dict(kwargs, "unix")) != NULL)
+			client->unix = kore_strdup(v);
+
+		client->curlopt = PyDict_GetItemString(kwargs, "curlopt");
+		Py_XINCREF(client->curlopt);
+
+		python_bool_from_dict(kwargs, "tlsverify", &client->tlsverify);
+	}
+
+	if ((client->tlscert != NULL && client->tlskey == NULL) ||
+	    (client->tlskey != NULL && client->tlscert == NULL)) {
+		Py_DECREF((PyObject *)client);
+		PyErr_SetString(PyExc_RuntimeError,
+		    "invalid TLS client configuration");
+		return (NULL);
+	}
+
+	return ((PyObject *)client);
+}
+
+static void
+pyhttp_client_dealloc(struct pyhttp_client *client)
+{
+	kore_free(client->url);
+	kore_free(client->unix);
+	kore_free(client->tlskey);
+	kore_free(client->tlscert);
+	kore_free(client->cabundle);
+
+	Py_XDECREF(client->curlopt);
+
+	PyObject_Del((PyObject *)client);
+}
+
+static PyObject *
+pyhttp_client_get(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_GET, kwargs));
+}
+
+static PyObject *
+pyhttp_client_put(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_PUT, kwargs));
+}
+
+static PyObject *
+pyhttp_client_post(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_POST, kwargs));
+}
+
+static PyObject *
+pyhttp_client_head(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_HEAD, kwargs));
+}
+
+static PyObject *
+pyhttp_client_patch(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_PATCH, kwargs));
+}
+
+static PyObject *
+pyhttp_client_delete(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_DELETE, kwargs));
+}
+
+static PyObject *
+pyhttp_client_options(struct pyhttp_client *client, PyObject *args,
+    PyObject *kwargs)
+{
+	return (pyhttp_client_request(client, HTTP_METHOD_OPTIONS, kwargs));
+}
+
+static PyObject *
+pyhttp_client_request(struct pyhttp_client *client, int m, PyObject *kwargs)
+{
+	struct pyhttp_client_op		*op;
+	char				*ptr;
+	const char			*k, *v;
+	Py_ssize_t			length, idx;
+	PyObject			*data, *headers, *key, *obj;
+
+	ptr = NULL;
+	length = 0;
+	headers = NULL;
+
+	if (kwargs != NULL &&
+	    ((headers = PyDict_GetItemString(kwargs, "headers")) != NULL)) {
+		if (!PyDict_CheckExact(headers)) {
+			PyErr_SetString(PyExc_RuntimeError,
+			    "headers keyword must be a dict");
+			return (NULL);
+		}
+	}
+
+	switch (m) {
+	case HTTP_METHOD_GET:
+	case HTTP_METHOD_HEAD:
+	case HTTP_METHOD_OPTIONS:
+		break;
+	case HTTP_METHOD_PUT:
+	case HTTP_METHOD_POST:
+	case HTTP_METHOD_PATCH:
+	case HTTP_METHOD_DELETE:
+		length = -1;
+
+		if (kwargs == NULL) {
+			if (m == HTTP_METHOD_DELETE) {
+				length = 0;
+				break;
+			}
+
+			PyErr_Format(PyExc_RuntimeError,
+			    "no keyword arguments given, but body expected ",
+			    http_method_text(m));
+			return (NULL);
+		}
+
+		if ((data = PyDict_GetItemString(kwargs, "body")) == NULL)
+			return (NULL);
+
+		if (PyBytes_AsStringAndSize(data, &ptr, &length) == -1)
+			return (NULL);
+
+		if (length < 0) {
+			PyErr_SetString(PyExc_TypeError, "invalid length");
+			return (NULL);
+		}
+		break;
+	default:
+		fatal("%s: unknown method %d", __func__, m);
+	}
+
+	op = PyObject_New(struct pyhttp_client_op, &pyhttp_client_op_type);
+	if (op == NULL)
+		return (NULL);
+
+	if (!kore_curl_init(&op->data.curl, client->url, KORE_CURL_ASYNC)) {
+		Py_DECREF((PyObject *)op);
+		PyErr_SetString(PyExc_RuntimeError, "failed to setup call");
+		return (NULL);
+	}
+
+	op->headers = 0;
+	op->coro = coro_running;
+	op->state = CURL_CLIENT_OP_RUN;
+	LIST_INIT(&op->data.slists);
+
+	Py_INCREF(client);
+	op->client = client;
+
+	kore_curl_http_setup(&op->data.curl, m, ptr, length);
+	kore_curl_bind_callback(&op->data.curl, python_curl_http_callback, op);
+
+	/* Go in with our own bare hands. */
+	if (client->unix != NULL) {
+#if defined(__linux__)
+		if (client->unix[0] == '@') {
+			curl_easy_setopt(op->data.curl.handle,
+			    CURLOPT_ABSTRACT_UNIX_SOCKET, client->unix + 1);
+		} else {
+			curl_easy_setopt(op->data.curl.handle,
+			    CURLOPT_UNIX_SOCKET_PATH, client->unix);
+		}
+#else
+		curl_easy_setopt(op->data.curl.handle, CURLOPT_UNIX_SOCKET_PATH,
+		    client->unix);
+#endif
+	}
+
+	if (client->tlskey != NULL && client->tlscert != NULL) {
+		 curl_easy_setopt(op->data.curl.handle, CURLOPT_SSLCERT,
+		    client->tlscert);
+		 curl_easy_setopt(op->data.curl.handle, CURLOPT_SSLKEY,
+		    client->tlskey);
+	}
+
+	if (client->tlsverify == 0) {
+		curl_easy_setopt(op->data.curl.handle,
+		    CURLOPT_SSL_VERIFYHOST, 0);
+		curl_easy_setopt(op->data.curl.handle,
+		    CURLOPT_SSL_VERIFYPEER, 0);
+	}
+
+	if (client->curlopt != NULL) {
+		if (!python_curlopt_from_dict(&op->data, client->curlopt)) {
+			Py_DECREF((PyObject *)op);
+			return (NULL);
+		}
+	}
+
+	if (client->cabundle != NULL) {
+		curl_easy_setopt(op->data.curl.handle, CURLOPT_CAINFO,
+		    client->cabundle);
+	}
+
+	if (headers != NULL) {
+		idx = 0;
+		while (PyDict_Next(headers, &idx, &key, &obj)) {
+			if ((k = PyUnicode_AsUTF8(key)) == NULL) {
+				Py_DECREF((PyObject *)op);
+				return (NULL);
+			}
+
+			if ((v = PyUnicode_AsUTF8(obj)) == NULL) {
+				Py_DECREF((PyObject *)op);
+				return (NULL);
+			}
+
+			kore_curl_http_set_header(&op->data.curl, k, v);
+		}
+	}
+
+	if (kwargs != NULL) {
+		if ((obj = PyDict_GetItemString(kwargs, "curlopt")) != NULL) {
+			if (!python_curlopt_from_dict(&op->data, obj)) {
+				Py_DECREF((PyObject *)op);
+				return (NULL);
+			}
+		}
+
+		python_bool_from_dict(kwargs, "return_headers", &op->headers);
+	}
+
+	return ((PyObject *)op);
+}
+
+static void
+pyhttp_client_op_dealloc(struct pyhttp_client_op *op)
+{
+	struct pycurl_slist	*psl;
+
+	while ((psl = LIST_FIRST(&op->data.slists))) {
+		LIST_REMOVE(psl, list);
+		curl_slist_free_all(psl->slist);
+		kore_free(psl);
+	}
+
+	Py_DECREF(op->client);
+	kore_curl_cleanup(&op->data.curl);
+	PyObject_Del((PyObject *)op);
+}
+
+static PyObject *
+pyhttp_client_op_await(PyObject *op)
+{
+	Py_INCREF(op);
+	return (op);
+}
+
+static PyObject *
+pyhttp_client_op_iternext(struct pyhttp_client_op *op)
+{
+	size_t			len;
+	struct http_header	*hdr;
+	const u_int8_t		*response;
+	PyObject		*result, *tuple, *dict, *value;
+
+	if (op->state == CURL_CLIENT_OP_RUN) {
+		kore_curl_run(&op->data.curl);
+		op->state = CURL_CLIENT_OP_RESULT;
+		Py_RETURN_NONE;
+	}
+
+	if (!kore_curl_success(&op->data.curl)) {
+		PyErr_Format(PyExc_RuntimeError, "request to '%s' failed: %s",
+		    op->data.curl.url, kore_curl_strerror(&op->data.curl));
+		return (NULL);
+	}
+
+	kore_curl_response_as_bytes(&op->data.curl, &response, &len);
+
+	if (op->headers) {
+		kore_curl_http_parse_headers(&op->data.curl);
+
+		if ((dict = PyDict_New()) == NULL)
+			return (NULL);
+
+		TAILQ_FOREACH(hdr, &op->data.curl.http.resp_hdrs, list) {
+			value = PyUnicode_FromString(hdr->value);
+			if (value == NULL) {
+				Py_DECREF(dict);
+				return (NULL);
+			}
+
+			if (PyDict_SetItemString(dict,
+			    hdr->header, value) == -1) {
+				Py_DECREF(dict);
+				Py_DECREF(value);
+				return (NULL);
+			}
+
+			Py_DECREF(value);
+		}
+
+		if ((tuple = Py_BuildValue("(iOy#)", op->data.curl.http.status,
+		    dict, (const char *)response, len)) == NULL)
+			return (NULL);
+
+		Py_DECREF(dict);
+	} else {
+		if ((tuple = Py_BuildValue("(iy#)", op->data.curl.http.status,
+		    (const char *)response, len)) == NULL)
+			return (NULL);
+	}
+
+	result = PyObject_CallFunctionObjArgs(PyExc_StopIteration, tuple, NULL);
+	if (result == NULL) {
+		Py_DECREF(tuple);
+		return (NULL);
+	}
+
+	Py_DECREF(tuple);
+	PyErr_SetObject(PyExc_StopIteration, result);
+	Py_DECREF(result);
+
+	return (NULL);
+}
+
+static void
+python_curl_http_callback(struct kore_curl *curl, void *arg)
+{
+	struct pyhttp_client_op		*op = arg;
+
+	if (op->coro->request != NULL)
+		http_request_wakeup(op->coro->request);
+	else
+		python_coro_wakeup(op->coro);
+}
+
+static void
+python_curl_handle_callback(struct kore_curl *curl, void *arg)
+{
+	struct pycurl_handle_op		*op = arg;
+
+	if (op->coro->request != NULL)
+		http_request_wakeup(op->coro->request);
+	else
+		python_coro_wakeup(op->coro);
 }
 #endif

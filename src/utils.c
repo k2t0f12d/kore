@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -47,65 +47,21 @@ static struct {
 };
 
 static void	fatal_log(const char *, va_list);
+static int	utils_base64_encode(const void *, size_t, char **,
+		    const char *, int);
+static int	utils_base64_decode(const char *, u_int8_t **,
+		    size_t *, const char *, int);
+static int	utils_x509name_tobuf(void *, int, int, const char *,
+		    const void *, size_t, int);
 
-static char b64table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static char b64_table[] = 	\
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-#if defined(KORE_DEBUG)
-void
-kore_debug_internal(char *file, int line, const char *fmt, ...)
-{
-	va_list		args;
-	char		buf[2048];
+static char b64url_table[] = 	\
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-	va_start(args, fmt);
-	(void)vsnprintf(buf, sizeof(buf), fmt, args);
-	va_end(args);
-
-	printf("[%d] %s:%d - %s\n", kore_pid, file, line, buf);
-}
-#endif
-
-void
-kore_log_init(void)
-{
-#if defined(KORE_SINGLE_BINARY)
-	extern const char	*__progname;
-	const char		*name = __progname;
-#else
-	const char		*name = "kore";
-#endif
-
-	if (!foreground)
-		openlog(name, LOG_NDELAY | LOG_PID, LOG_DAEMON);
-}
-
-void
-kore_log(int prio, const char *fmt, ...)
-{
-	va_list		args;
-	char		buf[2048], tmp[32];
-
-	va_start(args, fmt);
-	(void)vsnprintf(buf, sizeof(buf), fmt, args);
-	va_end(args);
-
-	if (worker != NULL) {
-		(void)snprintf(tmp, sizeof(tmp), "wrk %d", worker->id);
-#if !defined(KORE_NO_TLS)
-		if (worker->id == KORE_WORKER_KEYMGR)
-			(void)kore_strlcpy(tmp, "keymgr", sizeof(tmp));
-#endif
-		if (foreground)
-			printf("[%s]: %s\n", tmp, buf);
-		else
-			syslog(prio, "[%s]: %s", tmp, buf);
-	} else {
-		if (foreground)
-			printf("[parent]: %s\n", buf);
-		else
-			syslog(prio, "[parent]: %s", buf);
-	}
-}
+/* b64_table and b64url_table are the same size. */
+#define B64_TABLE_LEN		(sizeof(b64_table))
 
 size_t
 kore_strlcpy(char *dst, const char *src, const size_t len)
@@ -241,7 +197,7 @@ kore_strtodouble(const char *str, long double min, long double max, int *err)
 
 	errno = 0;
 	d = strtod(str, &ep);
-	if (d == 0 || errno == ERANGE || str == ep || *ep != '\0') {
+	if (errno == ERANGE || str == ep || *ep != '\0') {
 		*err = KORE_RESULT_ERROR;
 		return (0);
 	}
@@ -283,10 +239,11 @@ kore_split_string(char *input, const char *delim, char **out, size_t ele)
 }
 
 void
-kore_strip_chars(char *in, const char strip, char **out)
+kore_strip_chars(const char *in, const char strip, char **out)
 {
+	char		*p;
+	const char	*s;
 	u_int32_t	len;
-	char		*s, *p;
 
 	len = strlen(in);
 	*out = kore_malloc(len + 1);
@@ -317,7 +274,7 @@ kore_date_to_time(const char *http_date)
 	t = KORE_RESULT_ERROR;
 
 	if (kore_split_string(sdup, " ", args, 7) != 6) {
-		kore_debug("misformed http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed http-date: '%s'", http_date);
 		goto out;
 	}
 
@@ -325,7 +282,8 @@ kore_date_to_time(const char *http_date)
 
 	tm.tm_year = kore_strtonum(args[3], 10, 1900, 2068, &err) - 1900;
 	if (err == KORE_RESULT_ERROR) {
-		kore_debug("misformed year in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed year in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
@@ -337,36 +295,42 @@ kore_date_to_time(const char *http_date)
 	}
 
 	if (month_names[i].name == NULL) {
-		kore_debug("misformed month in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed month in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
 	tm.tm_mday = kore_strtonum(args[1], 10, 1, 31, &err);
 	if (err == KORE_RESULT_ERROR) {
-		kore_debug("misformed mday in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed mday in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
 	if (kore_split_string(args[4], ":", tbuf, 5) != 3) {
-		kore_debug("misformed HH:MM:SS in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed HH:MM:SS in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
 	tm.tm_hour = kore_strtonum(tbuf[0], 10, 0, 23, &err);
 	if (err == KORE_RESULT_ERROR) {
-		kore_debug("misformed hour in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed hour in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
 	tm.tm_min = kore_strtonum(tbuf[1], 10, 0, 59, &err);
 	if (err == KORE_RESULT_ERROR) {
-		kore_debug("misformed minutes in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed minutes in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
 	tm.tm_sec = kore_strtonum(tbuf[2], 10, 0, 60, &err);
 	if (err == KORE_RESULT_ERROR) {
-		kore_debug("misformed seconds in http-date: '%s'", http_date);
+		kore_log(LOG_WARNING, "misformed seconds in http-date: '%s'",
+		    http_date);
 		goto out;
 	}
 
@@ -374,7 +338,7 @@ kore_date_to_time(const char *http_date)
 	t = mktime(&tm) + ltm->tm_gmtoff;
 	if (t == -1) {
 		t = 0;
-		kore_debug("mktime() on '%s' failed", http_date);
+		kore_log(LOG_WARNING, "mktime() on '%s' failed", http_date);
 	}
 
 out:
@@ -393,10 +357,8 @@ kore_time_to_date(time_t now)
 		last = now;
 
 		tm = gmtime(&now);
-		if (!strftime(tbuf, sizeof(tbuf), "%a, %d %b %Y %T GMT", tm)) {
-			kore_debug("strftime() gave us NULL (%ld)", now);
+		if (!strftime(tbuf, sizeof(tbuf), "%a, %d %b %Y %T GMT", tm))
 			return (NULL);
-		}
 	}
 
 	return (tbuf);
@@ -413,134 +375,27 @@ kore_time_ms(void)
 }
 
 int
+kore_base64url_encode(const void *data, size_t len, char **out, int flags)
+{
+	return (utils_base64_encode(data, len, out, b64url_table, flags));
+}
+
+int
 kore_base64_encode(const void *data, size_t len, char **out)
 {
-	u_int8_t		n;
-	size_t			nb;
-	const u_int8_t		*ptr;
-	u_int32_t		bytes;
-	struct kore_buf		result;
+	return (utils_base64_encode(data, len, out, b64_table, 0));
+}
 
-	nb = 0;
-	ptr = data;
-	kore_buf_init(&result, (len / 3) * 4);
-
-	while (len > 0) {
-		if (len > 2) {
-			nb = 3;
-			bytes = *ptr++ << 16;
-			bytes |= *ptr++ << 8;
-			bytes |= *ptr++;
-		} else if (len > 1) {
-			nb = 2;
-			bytes = *ptr++ << 16;
-			bytes |= *ptr++ << 8;
-		} else if (len == 1) {
-			nb = 1;
-			bytes = *ptr++ << 16;
-		} else {
-			kore_buf_cleanup(&result);
-			return (KORE_RESULT_ERROR);
-		}
-
-		n = (bytes >> 18) & 0x3f;
-		kore_buf_append(&result, &(b64table[n]), 1);
-		n = (bytes >> 12) & 0x3f;
-		kore_buf_append(&result, &(b64table[n]), 1);
-		if (nb > 1) {
-			n = (bytes >> 6) & 0x3f;
-			kore_buf_append(&result, &(b64table[n]), 1);
-			if (nb > 2) {
-				n = bytes & 0x3f;
-				kore_buf_append(&result, &(b64table[n]), 1);
-			}
-		}
-
-		len -= nb;
-	}
-
-	switch (nb) {
-	case 1:
-		kore_buf_appendf(&result, "==");
-		break;
-	case 2:
-		kore_buf_appendf(&result, "=");
-		break;
-	case 3:
-		break;
-	default:
-		kore_buf_cleanup(&result);
-		return (KORE_RESULT_ERROR);
-	}
-
-	/* result.data gets taken over so no need to cleanup result. */
-	*out = kore_buf_stringify(&result, NULL);
-
-	return (KORE_RESULT_OK);
+int
+kore_base64url_decode(const char *in, u_int8_t **out, size_t *olen, int flags)
+{
+	return (utils_base64_decode(in, out, olen, b64url_table, flags));
 }
 
 int
 kore_base64_decode(const char *in, u_int8_t **out, size_t *olen)
 {
-	int			i, c;
-	struct kore_buf		*res;
-	u_int8_t		d, n, o;
-	u_int32_t		b, len, idx;
-
-	i = 4;
-	b = 0;
-	d = 0;
-	c = 0;
-	len = strlen(in);
-	res = kore_buf_alloc(len);
-
-	for (idx = 0; idx < len; idx++) {
-		c = in[idx];
-		if (c == '=')
-			break;
-
-		for (o = 0; o < sizeof(b64table); o++) {
-			if (b64table[o] == c) {
-				d = o;
-				break;
-			}
-		}
-
-		if (o == sizeof(b64table)) {
-			*out = NULL;
-			kore_buf_free(res);
-			return (KORE_RESULT_ERROR);
-		}
-
-		b |= (d & 0x3f) << ((i - 1) * 6);
-		i--;
-		if (i == 0) {
-			for (i = 2; i >= 0; i--) {
-				n = (b >> (8 * i));
-				kore_buf_append(res, &n, 1);
-			}
-
-			b = 0;
-			i = 4;
-		}
-	}
-
-	if (c == '=') {
-		if (i > 2) {
-			*out = NULL;
-			kore_buf_free(res);
-			return (KORE_RESULT_ERROR);
-		}
-
-		o = i;
-		for (i = 2; i >= o; i--) {
-			n = (b >> (8 * i));
-			kore_buf_append(res, &n, 1);
-		}
-	}
-
-	*out = kore_buf_release(res, olen);
-	return (KORE_RESULT_OK);
+	return (utils_base64_decode(in, out, olen, b64_table, 0));
 }
 
 void *
@@ -607,6 +462,76 @@ kore_read_line(FILE *fp, char *in, size_t len)
 	return (p);
 }
 
+const char *
+kore_worker_name(int id)
+{
+	static char	buf[64];
+
+	switch (id) {
+	case KORE_WORKER_KEYMGR:
+		(void)snprintf(buf, sizeof(buf), "[keymgr]");
+		break;
+	case KORE_WORKER_ACME:
+		(void)snprintf(buf, sizeof(buf), "[acme]");
+		break;
+	default:
+		(void)snprintf(buf, sizeof(buf), "[wrk %d]", id);
+		break;
+	}
+
+	return (buf);
+}
+
+int
+kore_x509_issuer_name(struct connection *c, char **out, int flags)
+{
+	struct kore_buf		buf;
+	KORE_X509_NAMES		*name;
+
+	if ((name = kore_tls_x509_issuer_name(c)) == NULL)
+		return (KORE_RESULT_ERROR);
+
+	kore_buf_init(&buf, 1024);
+
+	if (!kore_tls_x509name_foreach(name, flags, &buf,
+	    utils_x509name_tobuf)) {
+		kore_buf_cleanup(&buf);
+		return (KORE_RESULT_ERROR);
+	}
+
+	*out = kore_buf_stringify(&buf, NULL);
+
+	buf.offset = 0;
+	buf.data = NULL;
+
+	return (KORE_RESULT_OK);
+}
+
+int
+kore_x509_subject_name(struct connection *c, char **out, int flags)
+{
+	struct kore_buf		buf;
+	KORE_X509_NAMES		*name;
+
+	if ((name = kore_tls_x509_subject_name(c)) == NULL)
+		return (KORE_RESULT_ERROR);
+
+	kore_buf_init(&buf, 1024);
+
+	if (!kore_tls_x509name_foreach(name, flags, &buf,
+	    utils_x509name_tobuf)) {
+		kore_buf_cleanup(&buf);
+		return (KORE_RESULT_ERROR);
+	}
+
+	*out = kore_buf_stringify(&buf, NULL);
+
+	buf.offset = 0;
+	buf.data = NULL;
+
+	return (KORE_RESULT_OK);
+}
+
 void
 fatal(const char *fmt, ...)
 {
@@ -626,7 +551,7 @@ fatalx(const char *fmt, ...)
 
 	/* In case people call fatalx() from the parent context. */
 	if (worker != NULL)
-		kore_msg_send(KORE_MSG_PARENT, KORE_MSG_SHUTDOWN, NULL, 0);
+		kore_msg_send(KORE_MSG_PARENT, KORE_MSG_FATALX, NULL, 0);
 
 	va_start(args, fmt);
 	fatal_log(fmt, args);
@@ -639,17 +564,195 @@ static void
 fatal_log(const char *fmt, va_list args)
 {
 	char			buf[2048];
-	extern const char	*__progname;
 
 	(void)vsnprintf(buf, sizeof(buf), fmt, args);
+	kore_log(LOG_ERR, "fatal: %s", buf);
 
-	if (!foreground)
-		kore_log(LOG_ERR, "%s", buf);
-
-#if !defined(KORE_NO_TLS)
 	if (worker != NULL && worker->id == KORE_WORKER_KEYMGR)
 		kore_keymgr_cleanup(1);
-#endif
+}
 
-	printf("%s: %s\n", __progname, buf);
+static int
+utils_x509name_tobuf(void *udata, int islast, int nid, const char *field,
+    const void *data, size_t len, int flags)
+{
+	struct kore_buf		*buf = udata;
+
+	if (flags & KORE_X509_COMMON_NAME_ONLY) {
+		if (nid == KORE_X509_NAME_COMMON_NAME)
+			kore_buf_append(buf, data, len);
+	} else {
+		kore_buf_appendf(buf, "%s=", field);
+		kore_buf_append(buf, data, len);
+		if (!islast)
+			kore_buf_appendf(buf, " ");
+	}
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+utils_base64_encode(const void *data, size_t len, char **out,
+    const char *table, int flags)
+{
+	u_int8_t		n;
+	size_t			nb;
+	const u_int8_t		*ptr;
+	u_int32_t		bytes;
+	struct kore_buf		result;
+
+	nb = 0;
+	ptr = data;
+	kore_buf_init(&result, (len / 3) * 4);
+
+	while (len > 0) {
+		if (len > 2) {
+			nb = 3;
+			bytes = *ptr++ << 16;
+			bytes |= *ptr++ << 8;
+			bytes |= *ptr++;
+		} else if (len > 1) {
+			nb = 2;
+			bytes = *ptr++ << 16;
+			bytes |= *ptr++ << 8;
+		} else if (len == 1) {
+			nb = 1;
+			bytes = *ptr++ << 16;
+		} else {
+			kore_buf_cleanup(&result);
+			return (KORE_RESULT_ERROR);
+		}
+
+		n = (bytes >> 18) & 0x3f;
+		kore_buf_append(&result, &(table[n]), 1);
+		n = (bytes >> 12) & 0x3f;
+		kore_buf_append(&result, &(table[n]), 1);
+		if (nb > 1) {
+			n = (bytes >> 6) & 0x3f;
+			kore_buf_append(&result, &(table[n]), 1);
+			if (nb > 2) {
+				n = bytes & 0x3f;
+				kore_buf_append(&result, &(table[n]), 1);
+			}
+		}
+
+		len -= nb;
+	}
+
+	if (!(flags & KORE_BASE64_RAW)) {
+		switch (nb) {
+		case 1:
+			kore_buf_appendf(&result, "==");
+			break;
+		case 2:
+			kore_buf_appendf(&result, "=");
+			break;
+		case 3:
+			break;
+		default:
+			kore_buf_cleanup(&result);
+			return (KORE_RESULT_ERROR);
+		}
+	}
+
+	/* result.data gets taken over so no need to cleanup result. */
+	*out = kore_buf_stringify(&result, NULL);
+
+	return (KORE_RESULT_OK);
+}
+
+static int
+utils_base64_decode(const char *in, u_int8_t **out, size_t *olen,
+    const char *table, int flags)
+{
+	int			i, c;
+	u_int8_t		d, n, o;
+	struct kore_buf		*res, buf;
+	const char		*ptr, *pad;
+	u_int32_t		b, len, plen, idx;
+
+	i = 4;
+	b = 0;
+	d = 0;
+	c = 0;
+	len = strlen(in);
+	memset(&buf, 0, sizeof(buf));
+
+	if (flags & KORE_BASE64_RAW) {
+		switch (len % 4) {
+		case 2:
+			plen = 2;
+			pad = "==";
+			break;
+		case 3:
+			plen = 1;
+			pad = "=";
+			break;
+		default:
+			return (KORE_RESULT_ERROR);
+		}
+
+		kore_buf_init(&buf, len + plen);
+		kore_buf_append(&buf, in, len);
+		kore_buf_append(&buf, pad, plen);
+
+		len = len + plen;
+		ptr = (const char *)buf.data;
+	} else {
+		ptr = in;
+	}
+
+	res = kore_buf_alloc(len);
+
+	for (idx = 0; idx < len; idx++) {
+		c = ptr[idx];
+		if (c == '=')
+			break;
+
+		for (o = 0; o < B64_TABLE_LEN; o++) {
+			if (table[o] == c) {
+				d = o;
+				break;
+			}
+		}
+
+		if (o == B64_TABLE_LEN) {
+			*out = NULL;
+			kore_buf_free(res);
+			kore_buf_cleanup(&buf);
+			return (KORE_RESULT_ERROR);
+		}
+
+		b |= (d & 0x3f) << ((i - 1) * 6);
+		i--;
+		if (i == 0) {
+			for (i = 2; i >= 0; i--) {
+				n = (b >> (8 * i));
+				kore_buf_append(res, &n, 1);
+			}
+
+			b = 0;
+			i = 4;
+		}
+	}
+
+	if (c == '=') {
+		if (i > 2) {
+			*out = NULL;
+			kore_buf_free(res);
+			kore_buf_cleanup(&buf);
+			return (KORE_RESULT_ERROR);
+		}
+
+		o = i;
+		for (i = 2; i >= o; i--) {
+			n = (b >> (8 * i));
+			kore_buf_append(res, &n, 1);
+		}
+	}
+
+	kore_buf_cleanup(&buf);
+	*out = kore_buf_release(res, olen);
+
+	return (KORE_RESULT_OK);
 }

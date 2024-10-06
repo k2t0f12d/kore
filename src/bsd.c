@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013-2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2013-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -38,11 +38,12 @@
 #endif
 
 static int			kfd = -1;
+static int			scheduled = 0;
 static struct kevent		*events = NULL;
 static u_int32_t		event_count = 0;
 
 #if defined(KORE_USE_PLATFORM_PLEDGE)
-static char	pledges[256] = { "stdio rpath inet error" };
+static char	pledges[256] = { "stdio rpath inet" };
 #endif
 
 void
@@ -53,7 +54,6 @@ kore_platform_init(void)
 	int	mib[] = { CTL_HW, HW_NCPU };
 
 	if (sysctl(mib, 2, &n, &len, NULL, 0) == -1) {
-		kore_debug("kore_platform_init(): sysctl %s", errno_s);
 		cpu_count = 1;
 	} else {
 		cpu_count = (u_int16_t)n;
@@ -78,8 +78,6 @@ kore_platform_worker_setcpu(struct kore_worker *kw)
 void
 kore_platform_event_init(void)
 {
-	struct listener		*l;
-
 	if (kfd != -1)
 		close(kfd);
 	if (events != NULL)
@@ -90,14 +88,6 @@ kore_platform_event_init(void)
 
 	event_count = (worker_max_connections * 2) + nlisteners;
 	events = kore_calloc(event_count, sizeof(struct kevent));
-
-	/* Hack to check if we're running under the parent or not. */
-	if (worker != NULL) {
-		LIST_FOREACH(l, &listeners, list) {
-			kore_platform_event_schedule(l->fd,
-			    EVFILT_READ, EV_ADD | EV_DISABLE, l);
-		}
-	}
 }
 
 void
@@ -137,9 +127,6 @@ kore_platform_event_wait(u_int64_t timer)
 		fatal("kevent(): %s", errno_s);
 	}
 
-	if (n > 0)
-		kore_debug("main(): %d sockets available", n);
-
 	for (i = 0; i < n; i++) {
 		evt = (struct kore_event *)events[i].udata;
 
@@ -169,12 +156,25 @@ kore_platform_event_all(int fd, void *c)
 }
 
 void
+kore_platform_event_level_all(int fd, void *c)
+{
+	kore_platform_event_schedule(fd, EVFILT_READ, EV_ADD, c);
+	kore_platform_event_schedule(fd, EVFILT_WRITE, EV_ADD, c);
+}
+
+void
+kore_platform_event_level_read(int fd, void *c)
+{
+	kore_platform_event_schedule(fd, EVFILT_READ, EV_ADD, c);
+}
+
+void
 kore_platform_event_schedule(int fd, int type, int flags, void *data)
 {
 	struct kevent		event[1];
 
 	EV_SET(&event[0], fd, type, flags, 0, 0, data);
-	if (kevent(kfd, event, 1, NULL, 0, NULL) == -1)
+	if (kevent(kfd, event, 1, NULL, 0, NULL) == -1 && errno != ENOENT)
 		fatal("kevent: %s", errno_s);
 }
 
@@ -182,18 +182,36 @@ void
 kore_platform_enable_accept(void)
 {
 	struct listener		*l;
+	struct kore_server	*srv;
+	int			flags;
 
-	LIST_FOREACH(l, &listeners, list)
-		kore_platform_event_schedule(l->fd, EVFILT_READ, EV_ENABLE, l);
+	if (scheduled == 0) {
+		scheduled = 1;
+		flags = EV_ADD | EV_ENABLE;
+	} else {
+		flags = EV_ENABLE;
+	}
+
+	LIST_FOREACH(srv, &kore_servers, list) {
+		LIST_FOREACH(l, &srv->listeners, list) {
+			kore_platform_event_schedule(l->fd,
+			    EVFILT_READ, flags, l);
+		}
+	}
 }
 
 void
 kore_platform_disable_accept(void)
 {
 	struct listener		*l;
+	struct kore_server	*srv;
 
-	LIST_FOREACH(l, &listeners, list)
-		kore_platform_event_schedule(l->fd, EVFILT_READ, EV_DISABLE, l);
+	LIST_FOREACH(srv, &kore_servers, list) {
+		LIST_FOREACH(l, &srv->listeners, list) {
+			kore_platform_event_schedule(l->fd,
+			    EVFILT_READ, EV_DISABLE, l);
+		}
+	}
 }
 
 void
@@ -221,7 +239,7 @@ kore_platform_disable_write(int fd)
 }
 
 void
-kore_platform_proctitle(char *title)
+kore_platform_proctitle(const char *title)
 {
 #ifdef __MACH__
 	kore_proctitle(title);
@@ -272,10 +290,27 @@ kore_platform_sendfile(struct connection *c, struct netbuf *nb)
 }
 #endif
 
+void
+kore_platform_sandbox(void)
+{
+#if defined(KORE_USE_PLATFORM_PLEDGE)
+	kore_platform_pledge();
+#endif
+}
+
+u_int32_t
+kore_platform_random_uint32(void)
+{
+	return (arc4random());
+}
+
 #if defined(KORE_USE_PLATFORM_PLEDGE)
 void
 kore_platform_pledge(void)
 {
+	if (worker->id == KORE_WORKER_KEYMGR || worker->id == KORE_WORKER_ACME)
+		return;
+
 	if (pledge(pledges, NULL) == -1)
 		fatal("failed to pledge process");
 }

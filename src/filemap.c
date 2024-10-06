@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Joris Vink <joris@coders.se>
+ * Copyright (c) 2019-2022 Joris Vink <joris@coders.se>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -39,7 +39,7 @@ struct filemap_entry {
 
 int	filemap_resolve(struct http_request *);
 
-static void	filemap_serve(struct http_request *, struct filemap_entry *);
+static void	filemap_serve(struct http_request *, const struct filemap_entry *);
 
 static TAILQ_HEAD(, filemap_entry)	maps;
 
@@ -52,26 +52,27 @@ kore_filemap_init(void)
 	TAILQ_INIT(&maps);
 }
 
-int
-kore_filemap_create(struct kore_domain *dom, const char *path, const char *root)
+struct kore_route *
+kore_filemap_create(struct kore_domain *dom, const char *path,
+    const char *root, const char *auth)
 {
 	size_t				sz;
 	struct stat			st;
 	int				len;
-	struct kore_module_handle	*hdlr;
+	struct kore_route		*rt;
 	struct filemap_entry		*entry;
 	char				regex[1024], fpath[PATH_MAX];
 
 	sz = strlen(root);
 	if (sz == 0)
-		return (KORE_RESULT_ERROR);
+		return (NULL);
 
 	if (root[0] != '/' || root[sz - 1] != '/')
-		return (KORE_RESULT_ERROR);
+		return (NULL);
 
-	if (kore_root_path != NULL) {
+	if (worker_privsep.root != NULL) {
 		len = snprintf(fpath, sizeof(fpath), "%s/%s",
-		    kore_root_path, path);
+		    worker_privsep.root, path);
 		if (len == -1 || (size_t)len >= sizeof(fpath))
 			fatal("kore_filemap_create: failed to concat paths");
 	} else {
@@ -79,27 +80,29 @@ kore_filemap_create(struct kore_domain *dom, const char *path, const char *root)
 			fatal("kore_filemap_create: failed to copy path");
 	}
 
-	if (stat(fpath, &st) == -1)
-		return (KORE_RESULT_ERROR);
+	if (stat(fpath, &st) == -1) {
+		kore_log(LOG_ERR, "%s: failed to stat '%s': %s", __func__,
+		    fpath, errno_s);
+		return (NULL);
+	}
 
 	len = snprintf(regex, sizeof(regex), "^%s.*$", root);
 	if (len == -1 || (size_t)len >= sizeof(regex))
 		fatal("kore_filemap_create: buffer too small");
 
-	if (!kore_module_handler_new(regex, dom->domain,
-	    "filemap_resolve", NULL, HANDLER_TYPE_DYNAMIC))
-		return (KORE_RESULT_ERROR);
+	if ((rt = kore_route_create(dom, regex, HANDLER_TYPE_DYNAMIC)) == NULL)
+		return (NULL);
 
-	hdlr = NULL;
-	TAILQ_FOREACH(hdlr, &dom->handlers, list) {
-		if (!strcmp(hdlr->path, regex))
-			break;
+	if (auth != NULL) {
+		rt->auth = kore_auth_lookup(auth);
+		if (rt->auth == NULL) {
+			fatal("filemap for '%s' has unknown auth '%s'",
+			    path, auth);
+		}
 	}
 
-	if (hdlr == NULL)
-		fatal("couldn't find newly created handler for filemap");
-
-	hdlr->methods = HTTP_METHOD_GET | HTTP_METHOD_HEAD;
+	kore_route_callback(rt, "filemap_resolve");
+	rt->methods = HTTP_METHOD_GET | HTTP_METHOD_HEAD;
 
 	entry = kore_calloc(1, sizeof(*entry));
 	entry->domain = dom;
@@ -115,7 +118,7 @@ kore_filemap_create(struct kore_domain *dom, const char *path, const char *root)
 
 	TAILQ_INSERT_TAIL(&maps, entry, list);
 
-	return (KORE_RESULT_OK);
+	return (rt);
 }
 
 void
@@ -151,7 +154,7 @@ filemap_resolve(struct http_request *req)
 	best_len = 0;
 
 	TAILQ_FOREACH(entry, &maps, list) {
-		if (entry->domain != req->hdlr->dom)
+		if (entry->domain != req->rt->dom)
 			continue;
 
 		if (!strncmp(entry->root, req->path, entry->root_len)) {
@@ -174,10 +177,12 @@ filemap_resolve(struct http_request *req)
 }
 
 static void
-filemap_serve(struct http_request *req, struct filemap_entry *map)
+filemap_serve(struct http_request *req, const struct filemap_entry *map)
 {
 	struct stat		st;
+	struct connection	*c;
 	struct kore_fileref	*ref;
+	struct kore_server	*srv;
 	const char		*path;
 	int			len, fd, index;
 	char			fpath[PATH_MAX], rpath[PATH_MAX];
@@ -190,7 +195,7 @@ filemap_serve(struct http_request *req, struct filemap_entry *map)
 		return;
 	}
 
-	if (!http_argument_urldecode(fpath)) {
+	if (!http_argument_urldecode(fpath, 1)) {
 		http_response(req, HTTP_STATUS_BAD_REQUEST, NULL, 0);
 		return;
 	}
@@ -224,7 +229,10 @@ lookup:
 		return;
 	}
 
-	if ((ref = kore_fileref_get(rpath)) == NULL) {
+	c = req->owner;
+	srv = c->owner->server;
+
+	if ((ref = kore_fileref_get(rpath, srv->tls)) == NULL) {
 		if ((fd = open(fpath, O_RDONLY | O_NOFOLLOW)) == -1) {
 			switch (errno) {
 			case ENOENT:
@@ -271,7 +279,7 @@ lookup:
 			}
 
 			/* kore_fileref_create() takes ownership of the fd. */
-			ref = kore_fileref_create(fpath, fd,
+			ref = kore_fileref_create(srv, fpath, fd,
 			    st.st_size, &st.st_mtim);
 			if (ref == NULL) {
 				http_response(req,
